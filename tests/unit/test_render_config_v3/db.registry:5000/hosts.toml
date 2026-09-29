@@ -1,0 +1,6 @@
+server = "http://db.registry:5000"
+
+[host."http://db.registry:5000"]
+  capabilities = ["pull", "resolve"]
+  ca = "/known/file/path/ca.crt"
+  client = [["/known/file/path/cert.crt", "/known/file/path/cert.key"]]

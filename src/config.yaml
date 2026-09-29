@@ -92,13 +92,14 @@ options:
         addresses) which should be accessed directly, rather than through
         the proxy defined in http_proxy or https_proxy. Must be less than
         2023 characters long.
+  # NOTE: config_version is kept for compatibility but ignored.
   config_version:
     type: string
     default: v2
     description: |
-        Containerd config version. Can be "v1" or "v2".
-
-        DEPRECATED: config_version will be removed in a future release.
+        DEPRECATED: This option is ignored and will be removed in a future release.
+        The charm selects the configuration version based on the installed
+        containerd version.
   nvidia_apt_key_urls:
     type: string
     default: |

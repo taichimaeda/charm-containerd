@@ -1,12 +1,19 @@
 description: Overlay for attaching current charm
 applications:
+  # NOTE: Edge bundles a Python 3.10 msgspec module on Ubuntu 24.04.
+  calico:
+    channel: stable
   containerd:
     charm: {{charm}}
     channel: null
-    resources:
-      containerd: {{containerd_multiarch|default("0")}}
     options:
       disable-juju-proxy: "true"
+  custom-registry:
+    charm: docker-registry
+    channel: edge
+    num_units: 1
+    options:
+      auth-basic-password: integration-test-password
   docker-registry:
     charm: docker-registry
     channel: edge
@@ -20,4 +27,6 @@ relations:
 - - docker-registry:docker-registry
   - containerd:docker-registry
 - - docker-registry:cert-provider
+  - easyrsa:client
+- - custom-registry:cert-provider
   - easyrsa:client

@@ -18,7 +18,13 @@ from charmhelpers.core.host import service_restart
 
 from charms.reactive import is_state, remove_state
 
-from reactive.containerd import CONTAINERD_PACKAGE, apt_packages, reinstall_containerd, install_nvidia_drivers
+from reactive.containerd import (
+    CONTAINERD_PACKAGE,
+    apt_packages,
+    candidate_containerd_version,
+    install_nvidia_drivers,
+    reinstall_containerd,
+)
 
 
 class ActionError(Exception):
@@ -79,8 +85,12 @@ def _upgrade(containerd, gpu):
     try:
         pkg = CONTAINERD_PACKAGE
         if upgrade_list.get(f"{pkg}.upgrade-available"):
-            reinstall_containerd()
+            candidate_version = candidate_containerd_version()
+            reinstall_containerd(candidate_version)
             upgrade_list[f"{pkg}.upgrade-complete"] = True
+
+            # NOTE: Clearing this state republishes the upgraded containerd version.
+            remove_state("containerd.version-published")
 
         if gpu and action_get().get("force") and is_state("containerd.nvidia.ready"):
             force_gpu_upgrade = True
@@ -90,9 +100,8 @@ def _upgrade(containerd, gpu):
             for pkg in _gpu_packages():
                 upgrade_list[f"{pkg}.upgrade-complete"] = True
 
-        if any(upgrade_list.get(f"{pkg}.upgrade-complete") for pkg in upgrade_list):
+            # NOTE: Restart containerd after GPU package changes.
             service_restart(CONTAINERD_PACKAGE)
-            remove_state("containerd.version-published")
 
         return upgrade_list
 
