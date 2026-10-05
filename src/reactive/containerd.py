@@ -591,14 +591,11 @@ def upgrade_charm():
     # Prevent containerd apt pkg from being implicitly updated.
     apt_hold(CONTAINERD_PACKAGE)
 
-    remove_state("containerd.resource.evaluated")
-    if is_state("containerd.resource.installed"):
-        # if a resource is currently overriding the deb,
-        # upgrade containerd from the apt packages
-        reinstall_containerd()
-
-    # Re-render config in case the template has changed in the new charm.
-    config_changed()
+    if not is_state("containerd.resource.installed"):
+        # Apply configuration template changes shipped by the new charm.
+        # Skip if resource binary is installed
+        # because resource migration handles config rendering itself.
+        config_changed()
 
     # Clean up old nvidia sources.list.d files
     old_source_files = [
@@ -612,6 +609,61 @@ def upgrade_charm():
 
     # Update containerd version
     remove_state("containerd.version-published")
+
+
+LEGACY_RESOURCE_BINARIES = {
+    "containerd",
+    "containerd-shim",
+    "containerd-shim-runc-v1",
+    "containerd-shim-runc-v2",
+    "containerd-stress",
+    "ctr",
+}
+
+
+def _remove_legacy_resource_binaries() -> None:
+    """Remove legacy resource binaries not owned by an installed package."""
+    for binary in LEGACY_RESOURCE_BINARIES:
+        path = Path("/usr/bin") / binary
+        if not os.path.lexists(path):
+            continue
+        try:
+            check_output(["dpkg-query", "--search", path], stderr=STDOUT)
+        except CalledProcessError:
+            log("Removing unowned legacy resource binary {}".format(path))
+            os.remove(path)
+
+
+@when("containerd.resource.installed")
+@when_not("endpoint.containerd.departed")
+def migrate_resource_containerd():
+    """Replace resource binaries with the apt package."""
+    status.maintenance("Migrating containerd binaries to apt")
+    try:
+        apt_update(fatal=True)
+        resource_version = _installed_containerd_version()
+        candidate_version = candidate_containerd_version()
+        if candidate_version < resource_version:
+            raise RuntimeError(
+                "apt candidate {} is older than resource containerd {}".format(
+                    ".".join(map(str, candidate_version)),
+                    ".".join(map(str, resource_version)),
+                )
+            )
+
+        reinstall_containerd(candidate_version)
+        _remove_legacy_resource_binaries()
+    except (CalledProcessError, OSError, RuntimeError, ValueError):
+        log(traceback.format_exc())
+        set_state("containerd.resource-migration.failed")
+        return
+    remove_state("containerd.resource-migration.failed")
+
+    # Clear legacy flags for resource binaries.
+    remove_state("containerd.resource.installed")
+    remove_state("containerd.resource.evaluated")
+
+    set_state("containerd.installed")
 
 
 @when_not("containerd.br_netfilter.enabled")
@@ -641,46 +693,48 @@ def install_containerd():
     :return: None
     """
     status.maintenance("Installing containerd via apt")
-    reinstall_containerd()
-    config_changed()
+    try:
+        apt_update(fatal=True)
+        candidate_version = candidate_containerd_version()
+        reinstall_containerd(candidate_version)
+        set_state("containerd.installed")
+        remove_state("containerd.install.failed")
+    except (CalledProcessError, OSError, RuntimeError, ValueError):
+        log(traceback.format_exc())
+        set_state("containerd.install.failed")
 
 
-def reinstall_containerd():
-    """Install and hold containerd with apt."""
-    apt_update(fatal=True)
+def reinstall_containerd(candidate_version) -> None:
+    """Render config and reinstall containerd from apt."""
+    # Render first because apt may restart the newly installed binary.
+    if not _render_config(version=candidate_version):
+        raise RuntimeError("failed to render configuration for apt candidate")
+
     apt_unhold(CONTAINERD_PACKAGE)
-    apt_install([CONTAINERD_PACKAGE, "--reinstall"], fatal=True)
-    apt_hold(CONTAINERD_PACKAGE)
-    set_state("containerd.installed")
-    remove_state("containerd.resource.evaluated")
+    try:
+        apt_install([CONTAINERD_PACKAGE, "--reinstall"], fatal=True)
+    except CalledProcessError:
+        try:
+            remaining_version = _installed_containerd_version()
+        except (CalledProcessError, FileNotFoundError, ValueError):
+            raise
+        if not _render_config(version=remaining_version):
+            raise RuntimeError("failed to restore configuration after apt failure")
+        if not host.service_restart("containerd.service"):
+            raise RuntimeError("failed to restart containerd after apt failure")
+        if not _check_containerd():
+            raise RuntimeError("containerd CRI plugins are not healthy after apt failure")
+        raise
+    finally:
+        apt_hold(CONTAINERD_PACKAGE)
+
+    if not host.service_restart("containerd.service"):
+        raise RuntimeError("failed to restart containerd after apt reinstall")
+    if not _check_containerd():
+        raise RuntimeError("containerd CRI plugins are not healthy after apt reinstall")
 
 
 @when("containerd.installed")
-@when_not("containerd.resource.evaluated")
-def install_containerd_resource():
-    """Unpack containerd resource charm and install over deb binaries."""
-    status.maintenance("Unpacking containerd resource")
-    try:
-        bin_path = containerd.unpack_containerd_resource()
-    except containerd.ResourceFailure as e:
-        log("An error occurred extracting the resource")
-        log(traceback.format_exc())
-        status.blocked(str(e))
-        return
-
-    remove_state("containerd.resource.installed")
-    if bin_path is None:
-        log("An empty tar.gz resource was provided, using deb sources")
-    else:
-        status.maintenance("Installing containerd via resource")
-        for bin in bin_path.glob("./*"):
-            check_call(["install", bin, "/usr/bin/"])
-            set_state("containerd.resource.installed")
-    set_state("containerd.resource.evaluated")
-    set_state("containerd.restart")
-
-
-@when("containerd.resource.evaluated")
 @when_not("containerd.version-published")
 def publish_version_to_juju():
     """

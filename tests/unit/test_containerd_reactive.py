@@ -478,6 +478,191 @@ def test_render_config_v3(
         assert target.read_text() == expected.read_text().rstrip("\n")
 
 
+@mock.patch.object(containerd, "_check_containerd", return_value=True)
+@mock.patch.object(containerd.host, "service_restart", return_value=True)
+@mock.patch.object(containerd, "_render_config", return_value=True)
+@mock.patch.object(containerd, "apt_install")
+@mock.patch.object(containerd, "apt_unhold")
+@mock.patch.object(containerd, "apt_hold")
+def test_reinstall_containerd(
+    apt_hold,
+    apt_unhold,
+    apt_install,
+    render_config,
+    service_restart,
+    check_containerd,
+):
+    """Render candidate config before apt runs."""
+    calls = mock.Mock()
+    for name, mocked in (
+        ("render_config", render_config),
+        ("apt_unhold", apt_unhold),
+        ("apt_install", apt_install),
+        ("apt_hold", apt_hold),
+        ("service_restart", service_restart),
+        ("check_containerd", check_containerd),
+    ):
+        calls.attach_mock(mocked, name)
+
+    containerd.reinstall_containerd((2, 4, 1))
+
+    # Check the full call order.
+    assert calls.mock_calls == [
+        mock.call.render_config(version=(2, 4, 1)),
+        mock.call.apt_unhold(containerd.CONTAINERD_PACKAGE),
+        mock.call.apt_install([containerd.CONTAINERD_PACKAGE, "--reinstall"], fatal=True),
+        mock.call.apt_hold(containerd.CONTAINERD_PACKAGE),
+        mock.call.service_restart("containerd.service"),
+        mock.call.check_containerd(),
+    ]
+
+
+@mock.patch.object(containerd, "_check_containerd", return_value=True)
+@mock.patch.object(containerd.host, "service_restart", return_value=True)
+@mock.patch.object(containerd, "_render_config", return_value=True)
+@mock.patch.object(containerd, "_installed_containerd_version", return_value=(1, 7, 36))
+@mock.patch.object(containerd, "apt_install", side_effect=CalledProcessError(1, "apt-get"))
+@mock.patch.object(containerd, "apt_unhold")
+@mock.patch.object(containerd, "apt_hold")
+def test_reinstall_containerd_apt_failure(
+    apt_hold,
+    apt_unhold,
+    apt_install,
+    installed_containerd_version,
+    render_config,
+    service_restart,
+    check_containerd,
+):
+    """Restore config after an apt failure."""
+    calls = mock.Mock()
+    for name, mocked in (
+        ("render_config", render_config),
+        ("apt_unhold", apt_unhold),
+        ("apt_install", apt_install),
+        ("installed_containerd_version", installed_containerd_version),
+        ("service_restart", service_restart),
+        ("check_containerd", check_containerd),
+        ("apt_hold", apt_hold),
+    ):
+        calls.attach_mock(mocked, name)
+
+    with pytest.raises(CalledProcessError):
+        containerd.reinstall_containerd((2, 4, 1))
+
+    assert calls.mock_calls == [
+        mock.call.render_config(version=(2, 4, 1)),
+        mock.call.apt_unhold(containerd.CONTAINERD_PACKAGE),
+        mock.call.apt_install([containerd.CONTAINERD_PACKAGE, "--reinstall"], fatal=True),
+        mock.call.installed_containerd_version(),
+        mock.call.render_config(version=(1, 7, 36)),
+        mock.call.service_restart("containerd.service"),
+        mock.call.check_containerd(),
+        mock.call.apt_hold(containerd.CONTAINERD_PACKAGE),
+    ]
+
+
+@mock.patch.object(containerd, "check_output")
+@mock.patch.object(containerd.os.path, "lexists")
+@mock.patch.object(containerd.os, "remove")
+def test_remove_legacy_resource_binaries(remove, lexists, check_output):
+    """Remove only legacy binaries not owned by installed packages."""
+
+    def binary_exists(path):
+        existing = {"containerd", "containerd-shim"}
+        return os.path.basename(path) in existing
+
+    def dpkg_query(command, **_kwargs):
+        if command == ["dpkg-query", "--search", pathlib.Path("/usr/bin/containerd-shim")]:
+            raise CalledProcessError(1, command)
+        if command == ["dpkg-query", "--search", pathlib.Path("/usr/bin/containerd")]:
+            return b"containerd: /usr/bin/containerd"
+        raise AssertionError("Unexpected command: {}".format(command))
+
+    lexists.side_effect = binary_exists
+    check_output.side_effect = dpkg_query
+
+    containerd._remove_legacy_resource_binaries()
+
+    remove.assert_called_once_with(pathlib.Path("/usr/bin/containerd-shim"))
+
+
+@mock.patch.object(containerd, "set_state")
+@mock.patch.object(containerd, "remove_state")
+@mock.patch.object(containerd, "_remove_legacy_resource_binaries")
+@mock.patch.object(containerd, "reinstall_containerd")
+@mock.patch.object(containerd, "candidate_containerd_version", return_value=(2, 4, 1))
+@mock.patch.object(containerd, "_installed_containerd_version", return_value=(1, 7, 36))
+@mock.patch.object(containerd, "apt_update")
+def test_migrate_resource_containerd(
+    apt_update,
+    installed_containerd_version,
+    candidate_containerd_version,
+    reinstall_containerd,
+    remove_legacy_resource_binaries,
+    remove_state,
+    set_state,
+):
+    """Replace resource binaries with apt binaries."""
+    containerd.migrate_resource_containerd()
+
+    apt_update.assert_called_once_with(fatal=True)
+    installed_containerd_version.assert_called_once_with()
+    candidate_containerd_version.assert_called_once_with()
+    reinstall_containerd.assert_called_once_with((2, 4, 1))
+    remove_legacy_resource_binaries.assert_called_once_with()
+    remove_state.assert_has_calls(
+        [
+            mock.call("containerd.resource-migration.failed"),
+            mock.call("containerd.resource.installed"),
+            mock.call("containerd.resource.evaluated"),
+        ]
+    )
+    set_state.assert_called_once_with("containerd.installed")
+
+
+@mock.patch.object(containerd, "set_state")
+@mock.patch.object(containerd, "remove_state")
+@mock.patch.object(containerd, "reinstall_containerd")
+@mock.patch.object(containerd, "candidate_containerd_version", return_value=(1, 6, 39))
+@mock.patch.object(containerd, "_installed_containerd_version", return_value=(1, 7, 36))
+@mock.patch.object(containerd, "apt_update")
+def test_migrate_resource_containerd_downgrade(
+    apt_update,
+    installed_containerd_version,
+    candidate_containerd_version,
+    reinstall_containerd,
+    remove_state,
+    set_state,
+):
+    """Refuse an apt downgrade."""
+    containerd.migrate_resource_containerd()
+
+    reinstall_containerd.assert_not_called()
+    remove_state.assert_not_called()
+    set_state.assert_called_once_with("containerd.resource-migration.failed")
+
+
+@mock.patch.object(containerd, "set_state")
+@mock.patch.object(containerd, "remove_state")
+@mock.patch.object(containerd, "reinstall_containerd", side_effect=CalledProcessError(1, "apt-get"))
+@mock.patch.object(containerd, "candidate_containerd_version", return_value=(2, 4, 1))
+@mock.patch.object(containerd, "_installed_containerd_version", return_value=(1, 7, 36))
+@mock.patch.object(containerd, "apt_update")
+def test_migrate_resource_containerd_failure(
+    apt_update,
+    installed_containerd_version,
+    candidate_containerd_version,
+    reinstall_containerd,
+    remove_state,
+    set_state,
+):
+    """Keep migration flags after a failure."""
+    containerd.migrate_resource_containerd()
+
+    remove_state.assert_not_called()
+    set_state.assert_called_once_with("containerd.resource-migration.failed")
+
+
 def test_juju_proxy_changed():
     """Verify proxy changed bools are set as expected."""
     cached = {"http_proxy": "foo", "https_proxy": "foo", "no_proxy": "foo"}
