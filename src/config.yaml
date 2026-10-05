@@ -69,7 +69,8 @@ options:
     type: string
     default: "containerd-shim"
     description: |
-      Set a custom containerd shim.
+      DEPRECATED: Set a custom containerd shim for containerd 1.x.
+      This option has no effect with containerd 2.x and v3 config.
   http_proxy:
      type: string
      default: ""
@@ -96,9 +97,9 @@ options:
     type: string
     default: v2
     description: |
-        Containerd config version. Can be "v1" or "v2".
-
-        DEPRECATED: config_version will be removed in a future release.
+        DEPRECATED: This option is ignored and will be removed in a future release.
+        The charm selects the configuration version based on the installed
+        containerd version.
   nvidia_apt_key_urls:
     type: string
     default: |
