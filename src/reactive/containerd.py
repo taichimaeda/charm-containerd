@@ -439,6 +439,8 @@ class Registry:
         file_path = os.path.join(config_directory, "%s.%s" % (self.host, opt))
         with open(file_path, "wb") as f:
             f.write(file_contents)
+        # Protect client private keys with mode 0600. Certificates use 0644.
+        os.chmod(file_path, 0o600 if opt == "key" else 0o644)
         return file_path
 
     def _remove_tls_content(self, opt: str, config_directory: str) -> None:
@@ -963,10 +965,12 @@ def _render_registry_config(config_directory: str, registries: typing.List[Regis
         host_directory = registry_directory / registry.host
         os.makedirs(host_directory, mode=0o755, exist_ok=True)
         hosts_file = host_directory / REGISTRY_CONFIG_FILE
+        # Protect registry host configuration with mode 0600.
         render(
             REGISTRY_CONFIG_FILE,
             str(hosts_file),
             {"registry": registry},
+            perms=0o600,
         )
 
     for host_name in previous_hosts - current_hosts:
@@ -1067,7 +1071,8 @@ def _render_config(version=None):
             context["runtime"] = "runc"
 
     try:
-        render(template_config, str(Path(CONFIG_DIRECTORY) / CONFIG_FILE), context)
+        # Protect config.toml with mode 0600 because it may contain registry credentials.
+        render(template_config, str(Path(CONFIG_DIRECTORY) / CONFIG_FILE), context, perms=0o600)
     except OSError:
         log(traceback.format_exc())
         set_state("containerd.config-render.failed")

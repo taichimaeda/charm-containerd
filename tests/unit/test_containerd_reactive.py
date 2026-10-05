@@ -303,6 +303,7 @@ def test_render_registry_config(render, tmp_path):
         "hosts.toml",
         str(tmp_path / "certs.d" / "registry.example" / "hosts.toml"),
         {"registry": registry},
+        perms=0o600,
     )
     assert unitdata.kv().get("registry-hosts") == ["registry.example"]
 
@@ -322,6 +323,7 @@ def test_render_registry_config_stale(render, tmp_path):
         "hosts.toml",
         str(tmp_path / "certs.d" / "registry.example" / "hosts.toml"),
         {"registry": registry},
+        perms=0o600,
     )
     assert not stale_directory.exists()
     assert unitdata.kv().get("registry-hosts") == ["registry.example"]

@@ -373,6 +373,24 @@ async def test_config_version_ignored(ops_test, juju_config):
         assert containerd_config_version(config) == config_version
 
 
+async def test_config_file_permissions(ops_test):
+    """Check containerd config files are only readable by root."""
+    # Certificate files under /root/cdk are managed by the principal charm.
+    for unit in ops_test.model.applications["containerd"].units:
+        config = await containerd_config(unit)
+        paths = ["/etc/containerd/config.toml"]
+        if containerd_config_version(config) == 3:
+            output = await JujuRun.command(
+                unit,
+                "find /etc/containerd/certs.d -name hosts.toml -type f",
+            )
+            paths.extend(output.stdout.splitlines())
+
+        command = "stat -c '%a' " + " ".join(shlex.quote(path) for path in paths)
+        output = await JujuRun.command(unit, command)
+        assert set(output.stdout.splitlines()) == {"600"}
+
+
 async def test_config_dockerio_registry_exists(ops_test):
     """Check the Docker Hub registry exists in containerd config."""
     for unit in ops_test.model.applications["containerd"].units:
