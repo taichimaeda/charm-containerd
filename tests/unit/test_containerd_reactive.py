@@ -17,6 +17,93 @@ import pytest
 import jinja2
 
 
+@pytest.mark.parametrize(
+    "version,config_version",
+    [
+        ((1, 2, 13), 1),
+        ((1, 3, 0), 2),
+        ((1, 7, 36), 2),
+        ((2, 0, 0), 3),
+    ],
+)
+def test_containerd_config_version(version, config_version):
+    """Select the config version for the containerd version."""
+    assert containerd._containerd_config_version(version) == config_version
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        (0, 2, 0),
+        (3, 0, 0),
+    ],
+)
+def test_containerd_config_version_unsupported(version):
+    """Reject unsupported containerd versions."""
+    with pytest.raises(ValueError, match="not supported"):
+        containerd._containerd_config_version(version)
+
+
+@pytest.mark.parametrize(
+    "recorded_version,selected_version",
+    [
+        ("v1", 1),
+        ("v2", 2),
+        ("auto", 3),
+        (None, 3),
+    ],
+)
+@mock.patch.object(containerd.DB, "get")
+def test_resolve_config_version(db_get, recorded_version, selected_version):
+    """Use the recorded version or select one automatically."""
+    db_get.return_value = recorded_version
+
+    assert containerd._resolve_config_version((2, 2, 1)) == selected_version
+
+
+@mock.patch.object(containerd.DB, "get", return_value="invalid")
+def test_resolve_config_version_invalid(db_get):
+    """Reject an invalid recorded version."""
+    with pytest.raises(ValueError, match="Invalid recorded config version"):
+        containerd._resolve_config_version((2, 2, 1))
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "v1",
+        "v2",
+        "auto",
+    ],
+)
+@mock.patch.object(containerd.DB, "set")
+@mock.patch.object(containerd.DB, "get", return_value=None)
+def test_record_config_version(db_get, db_set, version):
+    """Record the configured version."""
+    containerd._record_config_version(version)
+
+    recorded_version = version if version in ("v1", "v2") else "auto"
+    db_set.assert_called_once_with("containerd.config-version", recorded_version)
+
+
+@mock.patch.object(containerd.DB, "set")
+@mock.patch.object(containerd.DB, "get", return_value=None)
+def test_record_config_version_default(db_get, db_set):
+    """Record auto by default."""
+    containerd._record_config_version()
+
+    db_set.assert_called_once_with("containerd.config-version", "auto")
+
+
+@mock.patch.object(containerd.DB, "set")
+@mock.patch.object(containerd.DB, "get", return_value="auto")
+def test_record_config_version_once(db_get, db_set):
+    """Record the config version only once."""
+    containerd._record_config_version("v1")
+
+    db_set.assert_not_called()
+
+
 def test_series_upgrade():
     """Verify series upgrade hook sets the status."""
     flags = {
@@ -156,26 +243,127 @@ def test_merge_custom_registries(tmp_path):
     assert not os.path.exists(os.path.join(tmp_path, "my.other.registry.cert"))
 
 
-@pytest.mark.parametrize("version", ("v1", "v2"))
+def test_merge_custom_registries_duplicate(tmp_path):
+    """Reject duplicate relation and config registries."""
+    unitdata.kv().set(
+        "registry",
+        {
+            "url": "https://mirror.example",
+            "host": "registry.example",
+        },
+    )
+    registries = json.dumps([{"url": "https://registry.example"}])
+
+    with pytest.raises(containerd.DuplicateError):
+        containerd.merge_custom_registries(tmp_path, registries, None)
+
+
+def test_insert_registry_from_relation():
+    """Add a relation registry."""
+    relation_registry = {
+        "url": "https://mirror.example",
+        "host": "registry.example",
+    }
+    unitdata.kv().set("registry", relation_registry)
+    registries = [containerd.Registry(url="https://other.example")]
+
+    result = containerd._insert_registry_from_relation(registries)
+
+    assert [registry.host for registry in result] == [
+        "other.example",
+        "registry.example",
+    ]
+
+
+def test_insert_registry_from_relation_duplicate():
+    """Reject a duplicate relation registry."""
+    relation_registry = {
+        "url": "https://mirror.example",
+        "host": "registry.example",
+    }
+    unitdata.kv().set("registry", relation_registry)
+    registries = [containerd.Registry(url="https://registry.example")]
+
+    with pytest.raises(containerd.DuplicateError):
+        containerd._insert_registry_from_relation(registries)
+
+
+@mock.patch.object(containerd, "render")
+def test_render_registry_config(render, tmp_path):
+    """Render and track registry hosts."""
+    registry = containerd.Registry(
+        url="https://mirror.example",
+        host="registry.example",
+    )
+
+    containerd._render_registry_config(str(tmp_path), [registry])
+
+    render.assert_called_once_with(
+        "hosts.toml",
+        str(tmp_path / "certs.d" / "registry.example" / "hosts.toml"),
+        {"registry": registry},
+    )
+    assert unitdata.kv().get("registry-hosts") == ["registry.example"]
+
+
+@mock.patch.object(containerd, "render")
+def test_render_registry_config_stale(render, tmp_path):
+    """Remove stale registry hosts."""
+    stale_directory = tmp_path / "certs.d" / "stale.example"
+    stale_directory.mkdir(parents=True)
+    (stale_directory / "hosts.toml").write_text("stale")
+    unitdata.kv().set("registry-hosts", ["stale.example"])
+    registry = containerd.Registry(url="https://mirror.example", host="registry.example")
+
+    containerd._render_registry_config(str(tmp_path), [registry])
+
+    render.assert_called_once_with(
+        "hosts.toml",
+        str(tmp_path / "certs.d" / "registry.example" / "hosts.toml"),
+        {"registry": registry},
+    )
+    assert not stale_directory.exists()
+    assert unitdata.kv().get("registry-hosts") == ["registry.example"]
+
+
+@pytest.mark.parametrize(
+    "version,config_version",
+    [
+        ((1, 2, 13), "v1"),
+        ((1, 7, 36), "v2"),
+        ((2, 4, 1), "v3"),
+    ],
+)
 @pytest.mark.parametrize("gpu", ("off", "on"), ids=("gpu off", "gpu on"))
+@mock.patch("reactive.containerd._installed_containerd_version")
 @mock.patch("reactive.containerd.endpoint_from_flag")
 @mock.patch("reactive.containerd.config")
 @mock.patch("charms.layer.containerd.can_mount_cgroup2", mock.Mock(return_value=False))
-def test_custom_registries_render(mock_config, mock_endpoint_from_flag, gpu, version, tmp_path):
-    """Verify exact rendering of config.toml files in both v1 and v2 formats."""
+def test_config_changed(
+    mock_config,
+    mock_endpoint_from_flag,
+    mock_installed_containerd_version,
+    gpu,
+    version,
+    config_version,
+    tmp_path,
+):
+    """Render the config schema supported by the containerd version."""
 
     class MockConfig(dict):
         def changed(self, *_args, **_kwargs):
             return False
 
-    def jinja_render(source, target, context):
+    def jinja_render(source, target, context, **_kwargs):
         env = jinja2.Environment(loader=jinja2.FileSystemLoader("src/templates"))
         template = env.get_template(source)
+        pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
         with open(target, "w") as fp:
             fp.write(template.render(context))
 
     render.side_effect = jinja_render
-    config = mock_config.return_value = MockConfig(config_version=version, gpu_driver="auto", runtime="auto")
+    config = mock_config.return_value = MockConfig(config_version="v1", gpu_driver="auto", runtime="auto")
+    mock_installed_containerd_version.return_value = version
     mock_endpoint_from_flag.return_value.get_sandbox_image.return_value = "sandbox-image"
     flags = {
         "containerd.nvidia.available": gpu == "on",
@@ -200,10 +388,21 @@ def test_custom_registries_render(mock_config, mock_endpoint_from_flag, gpu, ver
     )
     with mock.patch("reactive.containerd.CONFIG_DIRECTORY", tmp_path):
         containerd.config_changed()
-    f_name = f"nvidia-{gpu}-{version}-config.toml"
-    expected = pathlib.Path(__file__).parent / "test_custom_registries_render" / f_name
+
     target = pathlib.Path(tmp_path) / "config.toml"
-    assert target.read_text() == expected.read_text()
+    if config_version == "v3":
+        expected_directory = pathlib.Path(__file__).parent / "test_render_config_v3"
+        expected = expected_directory / f"nvidia-{gpu}-config.toml"
+        assert target.read_text() == expected.read_text().rstrip("\n")
+    else:
+        expected_directory = pathlib.Path(__file__).parent / "test_render_config_v2"
+        expected = expected_directory / f"nvidia-{gpu}-{config_version}-config.toml"
+        assert target.read_text() == expected.read_text()
+
+    if config_version == "v3":
+        target = pathlib.Path(tmp_path) / "certs.d" / "docker.io" / "hosts.toml"
+        expected = expected_directory / "docker.io" / "hosts.toml"
+        assert target.read_text() == expected.read_text().rstrip("\n")
 
 
 def test_juju_proxy_changed():
@@ -358,6 +557,7 @@ def test_containerd_version(mock_check, mock_version_set):
 
     mock_check.return_value = version
     containerd.publish_version_to_juju()
+
     mock_version_set.assert_called_once_with("1.5.9")
 
 
