@@ -1,5 +1,8 @@
 import asyncio
+import json
 import logging
+import uuid
+
 import jinja2
 from juju.unit import Unit
 from juju.application import Application
@@ -23,7 +26,7 @@ def format_kubectl_cmd(cmd: str) -> str:
 
 
 @pytest.mark.abort_on_fail
-async def test_build_and_deploy(ops_test):
+async def test_build_and_deploy(ops_test, tmp_path):
     """Build and deploy Containerd in bundle."""
     log.info("Build Charm...")
     charm = next(Path.cwd().glob("containerd*.charm"), None)
@@ -31,28 +34,21 @@ async def test_build_and_deploy(ops_test):
         log.info("Build Charm...")
         charm = await ops_test.build_charm(".")
 
-    build_script = Path.cwd() / "build-resources.sh"
-    resources = await ops_test.build_resources(build_script, with_sudo=False)
-    expected_resources = {"containerd-multiarch"}
+    # Use the empty-resource workaround so apt's containerd 2.x remains installed.
+    empty_resource = tmp_path / "containerd.tgz"
+    empty_resource.touch()
 
-    if resources and all(rsc.stem in expected_resources for rsc in resources):
-        resources = {rsc.stem.replace("-", "_"): rsc for rsc in resources}
-    else:
-        log.info("Failed to build resources, downloading from latest/edge")
-        arch_resources = ops_test.arch_specific_resources(charm)
-        resources = await ops_test.download_resources(charm, resources=arch_resources)
-        resources = {name.replace("-", "_"): rsc for name, rsc in resources.items()}
-
-    assert resources, "Failed to build or download charm resources."
-
-    context = dict(charm=charm, **resources)
     overlays = [
         ops_test.Bundle("kubernetes-core", channel="edge"),
         Path("tests/data/charm.yaml"),
     ]
 
     log.info("Build Bundle...")
-    bundle, *overlays = await ops_test.async_render_bundles(*overlays, **context)
+    bundle, *overlays = await ops_test.async_render_bundles(
+        *overlays,
+        charm=charm,
+        containerd_resource=empty_resource,
+    )
 
     log.info("Deploy Bundle...")
     model = ops_test.model_full_name
@@ -189,11 +185,9 @@ async def juju_config(ops_test):
     await ops_test.model.wait_for_idle(apps=list(to_revert.keys()), status="active")
 
 
-@pytest_asyncio.fixture(scope="module", params=["v1", "v2"])
-async def config_version(request, juju_config):
-    """Set the containerd config_version based on a parameter."""
-    await juju_config("containerd", config_version=request.param)
-    return request.param
+def containerd_config_version(config):
+    """Return the rendered containerd config version."""
+    return config.get("version", 1)
 
 
 async def containerd_config(unit):
@@ -203,27 +197,493 @@ async def containerd_config(unit):
     return toml.loads(output.stdout)
 
 
-async def test_containerd_registry_has_dockerio_mirror(config_version, ops_test):
-    """Test gathering the list of registries."""
-    plugin = "cri" if config_version == "v1" else "io.containerd.grpc.v1.cri"
-    for unit in ops_test.model.applications["containerd"].units:
-        config = await containerd_config(unit)
-        mirrors = config["plugins"][plugin]["registry"]["mirrors"]
-        assert "docker.io" in mirrors, "docker.io missing from containerd config"
-        assert mirrors["docker.io"]["endpoint"] == ["https://registry-1.docker.io"]
+async def containerd_registry_config(unit, host):
+    """Load a registry hosts.toml file."""
+    output = await JujuRun.command(unit, f"cat /etc/containerd/certs.d/{host}/hosts.toml")
+    return toml.loads(output.stdout)
 
 
-async def test_containerd_registry_with_private_registry(config_version, ops_test):
-    """Test whether private registry config is represented in containerd."""
-    registry_unit = ops_test.model.applications.get("docker-registry").units[0]
-    plugin = "cri" if config_version == "v1" else "io.containerd.grpc.v1.cri"
+async def relation_data(ops_test, unit, endpoint, remote_unit):
+    """Return data advertised by a related unit."""
+    rc, stdout, stderr = await ops_test.run(
+        "juju",
+        "show-unit",
+        "-m",
+        ops_test.model_full_name,
+        unit.name,
+        "--format=json",
+    )
+    assert rc == 0, f"Failed to read relation data: {(stderr or stdout).strip()}"
+
+    relations = json.loads(stdout)[unit.name]["relation-info"]
+    relation = next(info for info in relations if info["endpoint"] == endpoint)
+    return relation["related-units"][remote_unit.name]["data"]
+
+
+async def relation_registry_host(ops_test):
+    """Return the Docker registry host."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    registry_unit = ops_test.model.applications["docker-registry"].units[0]
+    registry_data = await relation_data(ops_test, unit, "docker-registry", registry_unit)
+    return json.loads(registry_data["registry_netloc"])
+
+
+async def run_image(unit, name, image):
+    """Run a pod with an image."""
+    delete = format_kubectl_cmd(f"delete pod {name} --ignore-not-found")
+    await JujuRun.command(unit, delete)
+    try:
+        run = format_kubectl_cmd(
+            f"run {name} "
+            f"--image={shlex.quote(image)} "
+            "--image-pull-policy=Always "
+            "--restart=Never "
+            "--command -- sleep 300"
+        )
+        await JujuRun.command(unit, run)
+
+        wait = format_kubectl_cmd(f"wait --for=condition=Ready pod/{name} --timeout=5m")
+        await JujuRun.command(unit, wait)
+    finally:
+        await JujuRun.command(unit, delete, check=False)
+
+
+@pytest.fixture(scope="module")
+def public_registry_image():
+    """Return an image from a public registry."""
+    return "docker.io/library/busybox:1.38.0"
+
+
+@pytest_asyncio.fixture(scope="module")
+async def private_registry_image(ops_test, public_registry_image):
+    """Push an image to the test registry."""
+    unit = ops_test.model.applications["docker-registry"].units[0]
+    action = await JujuRun.action(unit, "push", image=public_registry_image)
+    assert action.results["outcome"] == "success"
+    return action.results["raw"].removeprefix("pushed ")
+
+
+@pytest_asyncio.fixture()
+async def custom_registry_image(ops_test, juju_config, public_registry_image):
+    """Push an image to the custom registry."""
+    # Disable authentication while seeding the registry.
+    await juju_config("custom-registry", **{"auth-basic-password": ""})
+
+    registry_unit = ops_test.model.applications["custom-registry"].units[0]
+    action = await JujuRun.action(registry_unit, "push", image=public_registry_image)
+    assert action.results["outcome"] == "success"
+    return action.results["raw"].removeprefix("pushed ")
+
+
+@pytest_asyncio.fixture()
+async def custom_registry_config(ops_test, custom_registry_image):
+    """Return TLS config for the custom registry."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    host = custom_registry_image.split("/", 1)[0]
+    config = await containerd_config(unit)
+    config_version = containerd_config_version(config)
+
+    if config_version == 1:
+        configs = config["plugins"]["cri"]["registry"]["configs"]
+    if config_version == 2:
+        configs = config["plugins"]["io.containerd.grpc.v1.cri"]["registry"]["configs"]
+    if config_version in (1, 2):
+        # Reuse the related registry TLS files for the custom registry.
+        related_host = await relation_registry_host(ops_test)
+        registry = next(value for key, value in configs.items() if related_host in key)
+        ca = registry["tls"]["ca_file"]
+        cert = registry["tls"]["cert_file"]
+        key = registry["tls"]["key_file"]
+
+    if config_version == 3:
+        # Reuse the related registry TLS files for the custom registry.
+        related_host = await relation_registry_host(ops_test)
+        related_hosts = await containerd_registry_config(unit, related_host)
+        mirror = next(iter(related_hosts["host"].values()))
+        ca = mirror["ca"]
+        cert, key = mirror["client"][0]
+
+    async def file_content(path):
+        output = await JujuRun.command(unit, f"base64 -w0 {shlex.quote(path)}")
+        return output.stdout
+
+    config = {
+        "url": f"https://{host}",
+        "ca_file": await file_content(ca),
+        "cert_file": await file_content(cert),
+        "key_file": await file_content(key),
+    }
+    return config
+
+
+async def test_config_version_ignored(ops_test, juju_config):
+    """Ignore config_version on a new deployment."""
+    units = ops_test.model.applications["containerd"].units
+    config = await containerd_config(units[0])
+    config_version = containerd_config_version(config)
+    wrong_version = "v2" if config_version == 1 else "v1"
+
+    await juju_config("containerd", config_version=wrong_version)
+    for unit in units:
+        config = await containerd_config(unit)
+        assert containerd_config_version(config) == config_version
+
+
+@pytest.mark.parametrize(
+    "old_version,new_version,expected_version",
+    [
+        (None, "v1", 3),
+        ("v1", "v2", 1),
+        ("v2", "v1", 2),
+    ],
+)
+async def test_config_version_preserved(
+    ops_test,
+    tmp_path,
+    old_version,
+    new_version,
+    expected_version,
+):
+    """Preserve explicit config_version on a refreshed deployment."""
+    charm = (await ops_test.build_charm(".")).resolve()
+
+    # Use the empty-resource workaround.
+    empty_resource = tmp_path / "containerd.tgz"
+    empty_resource.touch()
+
+    model_name = f"config-version-{old_version or 'unset'}"
+    await ops_test.track_model(
+        model_name,
+        keep=False,
+        config={"default-base": "ubuntu@24.04"},
+    )
+    try:
+        with ops_test.model_context(model_name) as model:
+            await model.deploy(
+                "kubernetes-worker",
+                channel="1.36/edge",
+                base="ubuntu@24.04",
+            )
+            # await model.deploy(
+            #     "containerd",
+            #     application_name="containerd",
+            #     channel="latest/edge",
+            #     revision=104,
+            #     base="ubuntu@24.04",
+            #     config={"config_version": old_version} if old_version else None,
+            #     resources={"containerd": str(empty_resource)},
+            # )
+            # Work around model.deploy() failing with an empty resource:
+            # TypeError: Strings must be encoded before hashing
+            deploy = [
+                "juju",
+                "deploy",
+                "-m",
+                ops_test.model_full_name,
+                "containerd",
+                "containerd",
+                "--channel",
+                "latest/edge",
+                "--revision",
+                "104",
+                "--base",
+                "ubuntu@24.04",
+                "--resource",
+                f"containerd={empty_resource}",
+            ]
+            if old_version:
+                deploy.extend(("--config", f"config_version={old_version}"))
+            rc, stdout, stderr = await ops_test.run(*deploy)
+            assert rc == 0, f"Containerd deploy failed: {(stderr or stdout).strip()}"
+
+            await model.add_relation(
+                "containerd:containerd",
+                "kubernetes-worker:container-runtime",
+            )
+            await model.wait_for_idle(
+                apps=["containerd"],
+                raise_on_error=False,
+                timeout=20 * 60,
+            )
+
+            # Refresh once to record the old config_version.
+            application = model.applications["containerd"]
+
+            # Default before config_version was deprecated.
+            charm_config = await application.get_config()
+            assert charm_config["config_version"]["value"] == (old_version or "v2")
+
+            await application.refresh(
+                path=charm,
+                force_units=True,
+            )
+            await model.wait_for_idle(
+                apps=["containerd"],
+                status="active",
+                timeout=20 * 60,
+            )
+
+            # Default after config_version was deprecated.
+            charm_config = await application.get_config()
+            assert charm_config["config_version"]["value"] == (old_version or "auto")
+
+            unit = application.units[0]
+            config = await containerd_config(unit)
+            assert containerd_config_version(config) == expected_version
+
+            # Set a new config_version after the old value has been recorded.
+            await application.set_config({"config_version": new_version})
+            await model.wait_for_idle(
+                apps=["containerd"],
+                status="active",
+                timeout=20 * 60,
+            )
+
+            # Refresh again to ensure the old value is preserved.
+            await application.refresh(
+                path=charm,
+                force_units=True,
+            )
+            await model.wait_for_idle(
+                apps=["containerd"],
+                status="active",
+                timeout=20 * 60,
+            )
+
+            config = await containerd_config(unit)
+            assert containerd_config_version(config) == expected_version
+    finally:
+        await ops_test.forget_model(
+            model_name,
+            timeout=20 * 60,
+            destroy_storage=True,
+            allow_failure=False,
+        )
+
+
+async def test_config_dockerio_registry_exists(ops_test):
+    """Check the Docker Hub registry exists in containerd config."""
     for unit in ops_test.model.applications["containerd"].units:
         config = await containerd_config(unit)
-        configs = config["plugins"][plugin]["registry"]["configs"]
-        assert len(configs) == 1, "registry config isn't represented in config.toml"
-        docker_registry = next(iter(configs))
-        assert configs[docker_registry]["tls"], "TLS config isn't represented in the config.toml"
-        assert docker_registry in registry_unit.workload_status_message
+        config_version = containerd_config_version(config)
+
+        if config_version == 1:
+            mirrors = config["plugins"]["cri"]["registry"]["mirrors"]
+        if config_version == 2:
+            mirrors = config["plugins"]["io.containerd.grpc.v1.cri"]["registry"]["mirrors"]
+        if config_version in (1, 2):
+            assert "docker.io" in mirrors, "Docker Hub registry missing from containerd config"
+            assert mirrors["docker.io"]["endpoint"] == ["https://registry-1.docker.io"]
+
+        if config_version == 3:
+            hosts = await containerd_registry_config(unit, "docker.io")
+            assert hosts["server"] == "https://docker.io"
+            assert "https://registry-1.docker.io" in hosts["host"]
+
+
+async def test_config_relation_registry_exists(ops_test):
+    """Check the relation registry exists in containerd config."""
+    registry_unit = ops_test.model.applications["docker-registry"].units[0]
+    for unit in ops_test.model.applications["containerd"].units:
+        host = await relation_registry_host(ops_test)
+        config = await containerd_config(unit)
+        config_version = containerd_config_version(config)
+
+        if config_version == 1:
+            configs = config["plugins"]["cri"]["registry"]["configs"]
+        if config_version == 2:
+            configs = config["plugins"]["io.containerd.grpc.v1.cri"]["registry"]["configs"]
+        if config_version in (1, 2):
+            assert len(configs) == 1, "Expected one registry config in config.toml"
+            docker_registry = next(iter(configs))
+            assert configs[docker_registry]["tls"], "TLS config missing from config.toml"
+            assert docker_registry in registry_unit.workload_status_message
+
+        if config_version == 3:
+            hosts = await containerd_registry_config(unit, host)
+            mirror = next(iter(hosts["host"].values()))
+            assert mirror["ca"], "CA config missing from hosts.toml"
+            assert mirror["client"], "Client TLS config missing from hosts.toml"
+
+            registry = config["plugins"]["io.containerd.cri.v1.images"]["registry"]
+            assert "configs" not in registry
+
+
+async def test_proxy_registry_pull(ops_test, juju_config):
+    """Check containerd uses its configured proxy."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    service = "containerd-proxy-test"
+    port = 18080
+    proxy = {
+        "http_proxy": "",
+        "https_proxy": f"http://127.0.0.1:{port}",
+        "no_proxy": "",
+    }
+
+    await JujuRun.command(unit, f"systemctl stop {service}", check=False)
+    start = f"systemd-run --unit={service} --collect --quiet " f"python3 -m http.server {port} --bind 127.0.0.1"
+    await JujuRun.command(unit, start)
+
+    try:
+        await juju_config("containerd", **proxy)
+        pull = await JujuRun.command(unit, "ctr images pull proxy-test.invalid/test:latest", check=False)
+        assert not pull.success
+
+        logs = await JujuRun.command(unit, f"journalctl --unit={service} --no-pager --output=cat")
+        assert "CONNECT proxy-test.invalid:443" in logs.stdout
+    finally:
+        await JujuRun.command(unit, f"systemctl stop {service}", check=False)
+        containerd = ops_test.model.applications["containerd"]
+        await containerd.set_config({key: "" for key in proxy})
+        await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+
+
+async def test_public_registry_pull(ops_test, public_registry_image):
+    """Pull an image from a public registry."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    await run_image(unit, "containerd-public-pull", public_registry_image)
+
+
+async def test_private_registry_tls_pull(ops_test, private_registry_image):
+    """Pull an image from the private TLS registry."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    await run_image(unit, "containerd-private-tls-pull", private_registry_image)
+
+
+async def test_private_registry_basic_auth_pull(ops_test, juju_config, private_registry_image):
+    """Pull an image from the private registry with basic auth."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    username = "admin"
+    password = f"integration-test-{uuid.uuid4().hex}"
+    await juju_config(
+        "docker-registry",
+        **{
+            "auth-basic-user": username,
+            "auth-basic-password": password,
+        },
+    )
+    await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+
+    await run_image(unit, "containerd-private-auth-pull", private_registry_image)
+
+
+@pytest.mark.parametrize(
+    "invalid_config",
+    ("", "{}", "[{}]"),
+    ids=("empty", "not-a-list", "missing-url"),
+)
+async def test_custom_registries_invalid(ops_test, invalid_config):
+    """Check invalid registry configuration blocks the charm and can be corrected."""
+    containerd = ops_test.model.applications["containerd"]
+    config = await containerd.get_config()
+    previous = config["custom_registries"]["value"]
+
+    try:
+        await containerd.set_config({"custom_registries": invalid_config})
+        await ops_test.model.wait_for_idle(
+            apps=["containerd"],
+            status="blocked",
+            timeout=10 * 60,
+        )
+    finally:
+        await containerd.set_config({"custom_registries": previous})
+        await ops_test.model.wait_for_idle(
+            apps=["containerd"],
+            status="active",
+            timeout=10 * 60,
+        )
+
+
+async def test_custom_registry_tls_pull(
+    ops_test,
+    custom_registry_image,
+    custom_registry_config,
+):
+    """Pull an image from a custom TLS registry."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    containerd = ops_test.model.applications["containerd"]
+
+    try:
+        await containerd.set_config({"custom_registries": json.dumps([custom_registry_config])})
+        await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+        await run_image(unit, "containerd-custom-tls-pull", custom_registry_image)
+    finally:
+        await containerd.set_config({"custom_registries": "[]"})
+        await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+
+
+async def test_custom_registry_basic_auth_pull(
+    ops_test,
+    juju_config,
+    custom_registry_image,
+    custom_registry_config,
+):
+    """Pull an image from a custom registry with basic auth."""
+    unit = ops_test.model.applications["containerd"].units[0]
+    username = "admin"
+    password = f"integration-test-{uuid.uuid4().hex}"
+    await juju_config(
+        "custom-registry",
+        **{
+            "auth-basic-user": username,
+            "auth-basic-password": password,
+        },
+    )
+    custom_registry_config.update({"username": username, "password": password})
+    containerd = ops_test.model.applications["containerd"]
+
+    try:
+        await containerd.set_config({"custom_registries": json.dumps([custom_registry_config])})
+        await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+        await run_image(unit, "containerd-custom-auth-pull", custom_registry_image)
+    finally:
+        await containerd.set_config({"custom_registries": "[]"})
+        await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+
+
+async def test_private_registry_relation_cleanup(ops_test, juju_config):
+    """Check remove relation cleans up the registry config."""
+    await juju_config("docker-registry", **{"auth-basic-password": "integration-test-password"})
+    await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+
+    host = await relation_registry_host(ops_test)
+    await ops_test.juju(
+        "remove-relation",
+        "docker-registry:docker-registry",
+        "containerd:docker-registry",
+        check=True,
+    )
+    try:
+        await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=10 * 60)
+        for unit in ops_test.model.applications["containerd"].units:
+            config = await containerd_config(unit)
+            config_version = containerd_config_version(config)
+
+            if config_version == 1:
+                registry = config["plugins"]["cri"]["registry"]
+            if config_version == 2:
+                registry = config["plugins"]["io.containerd.grpc.v1.cri"]["registry"]
+            if config_version in (1, 2):
+                configs = registry.get("configs", {})
+                assert all(host not in key for key in configs)
+
+            if config_version == 3:
+                path = f"/etc/containerd/certs.d/{host}/hosts.toml"
+                output = await JujuRun.command(unit, f"test ! -e {shlex.quote(path)}")
+                assert output.success
+                registry = config["plugins"]["io.containerd.cri.v1.images"]["registry"]
+                configs = registry.get("configs", {})
+                assert all(host not in key for key in configs)
+    finally:
+        await ops_test.model.add_relation(
+            "docker-registry:docker-registry",
+            "containerd:docker-registry",
+        )
+        await ops_test.model.wait_for_idle(
+            apps=["containerd", "docker-registry"],
+            status="active",
+            timeout=10 * 60,
+        )
 
 
 async def test_containerd_disable_gpu_support(ops_test, juju_config):
