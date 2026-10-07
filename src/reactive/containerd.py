@@ -569,6 +569,7 @@ def invalid_custom_registries(custom_registries):
     try:
         _registries_list(custom_registries)
     except ValidationError as e:
+        log(traceback.format_exc())
         return str(e)
 
 
