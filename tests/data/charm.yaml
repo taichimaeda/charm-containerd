@@ -3,8 +3,6 @@ applications:
   containerd:
     charm: {{charm}}
     channel: null
-    resources:
-      containerd: {{containerd_resource}}
     options:
       disable-juju-proxy: "true"
   docker-registry:

@@ -9,6 +9,7 @@ from juju.application import Application
 from pathlib import Path
 import pytest
 import pytest_asyncio
+import re
 import shlex
 import toml
 from typing import Dict
@@ -26,7 +27,7 @@ def format_kubectl_cmd(cmd: str) -> str:
 
 
 @pytest.mark.abort_on_fail
-async def test_build_and_deploy(ops_test, tmp_path):
+async def test_build_and_deploy(ops_test):
     """Build and deploy Containerd in bundle."""
     log.info("Build Charm...")
     charm = next(Path.cwd().glob("containerd*.charm"), None)
@@ -34,21 +35,13 @@ async def test_build_and_deploy(ops_test, tmp_path):
         log.info("Build Charm...")
         charm = await ops_test.build_charm(".")
 
-    # Use the empty-resource workaround so apt's containerd 2.x remains installed.
-    empty_resource = tmp_path / "containerd.tgz"
-    empty_resource.touch()
-
     overlays = [
-        ops_test.Bundle("kubernetes-core", channel="edge"),
+        ops_test.Bundle("kubernetes-core", channel="1.36/edge"),
         Path("tests/data/charm.yaml"),
     ]
 
     log.info("Build Bundle...")
-    bundle, *overlays = await ops_test.async_render_bundles(
-        *overlays,
-        charm=charm,
-        containerd_resource=empty_resource,
-    )
+    bundle, *overlays = await ops_test.async_render_bundles(*overlays, charm=charm)
 
     log.info("Deploy Bundle...")
     model = ops_test.model_full_name
@@ -83,6 +76,18 @@ async def pods_in_state(unit: Unit, selector: Dict[str, str], state: str = "Runn
     pod_set = result.stdout.splitlines()
     assert pod_set and all(state in line for line in pod_set)
     return pod_set
+
+
+@retry(
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(12),
+    reraise=True,
+)
+async def nodes_in_state(unit: Unit, count: int, state: str):
+    """Retry checking until all nodes match the specified state."""
+    result = await JujuRun.command(unit, format_kubectl_cmd("get nodes"))
+    assert result.stdout.count(state) == count
+    return result
 
 
 @pytest.mark.parametrize("which_action", ("containerd", "packages"))
@@ -195,6 +200,20 @@ async def containerd_config(unit):
     output = await JujuRun.command(unit, "cat /etc/containerd/config.toml")
     assert output.stdout, "Containerd output was empty"
     return toml.loads(output.stdout)
+
+
+async def containerd_version(unit):
+    """Return the containerd version."""
+    output = await JujuRun.command(unit, "containerd --version")
+    match = re.search(r"(?<!\d)v?(\d+\.\d+\.\d+)(?!\d)", output.stdout)
+    assert match, f"Unable to parse containerd version: {output.stdout}"
+    return match.group(1)
+
+
+async def containerd_major_version(unit):
+    """Return the containerd major version."""
+    version = await containerd_version(unit)
+    return int(version.split(".", 1)[0])
 
 
 async def containerd_registry_config(unit, host):
@@ -314,6 +333,49 @@ async def custom_registry_config(ops_test, custom_registry_image):
         "key_file": await file_content(key),
     }
     return config
+
+
+async def test_containerd_install(ops_test):
+    """Check apt package binary ownership."""
+    for unit in ops_test.model.applications["containerd"].units:
+        output = await JujuRun.command(unit, "dpkg --verify containerd")
+        assert not output.stdout
+
+        output = await JujuRun.command(unit, "test ! -e /usr/bin/containerd-shim")
+        assert output.success
+
+
+async def test_cri_version(ops_test):
+    """Check ctr can connect to containerd daemon."""
+    for unit in ops_test.model.applications["containerd"].units:
+        output = await JujuRun.command(unit, "ctr version")
+        assert output.success
+
+
+async def test_cri_plugins(ops_test):
+    """Check the status of CRI plugins."""
+    expected = {
+        1: {("io.containerd.grpc.v1", "cri")},
+        2: {
+            ("io.containerd.grpc.v1", "cri"),
+            ("io.containerd.cri.v1", "images"),
+            ("io.containerd.cri.v1", "runtime"),
+        },
+    }
+    for unit in ops_test.model.applications["containerd"].units:
+        major = await containerd_major_version(unit)
+        output = await JujuRun.command(unit, "ctr plugins ls")
+        healthy_plugins = set()
+        for line in output.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 4:
+                continue
+
+            plugin_type, plugin_id, _, status = fields
+            if status == "ok":
+                healthy_plugins.add((plugin_type, plugin_id))
+
+        assert expected[major] <= healthy_plugins
 
 
 async def test_config_version_ignored(ops_test, juju_config):
@@ -459,6 +521,24 @@ async def test_config_version_preserved(
             destroy_storage=True,
             allow_failure=False,
         )
+
+
+async def test_config_file_permissions(ops_test):
+    """Check containerd config files are only readable by root."""
+    # Certificate files under /root/cdk are managed by the principal charm.
+    for unit in ops_test.model.applications["containerd"].units:
+        config = await containerd_config(unit)
+        paths = ["/etc/containerd/config.toml"]
+        if containerd_config_version(config) == 3:
+            output = await JujuRun.command(
+                unit,
+                "find /etc/containerd/certs.d -name hosts.toml -type f",
+            )
+            paths.extend(output.stdout.splitlines())
+
+        command = "stat -c '%a' " + " ".join(shlex.quote(path) for path in paths)
+        output = await JujuRun.command(unit, command)
+        assert set(output.stdout.splitlines()) == {"600"}
 
 
 async def test_config_dockerio_registry_exists(ops_test):
@@ -738,16 +818,21 @@ async def microbots(ops_test: OpsTest, tmp_path: Path):
     rendered = str(tmp_path / "microbot.yaml")
     microbot = jinja2.Template(Path("tests/data/microbot.yaml.j2").read_text())
     microbot.stream(**context).dump(rendered)
-    kubectl = format_kubectl_cmd("{command} -f /tmp/microbot.yaml")
+    apply = format_kubectl_cmd("apply -f /tmp/microbot.yaml")
+    delete = format_kubectl_cmd("delete -f /tmp/microbot.yaml --ignore-not-found")
+    cleanup = format_kubectl_cmd("delete pod -l=app=microbot --ignore-not-found --force --grace-period=0")
     try:
         cmd = f"scp {rendered} {any_worker.name}:/tmp/microbot.yaml"
         await ops_test.juju(*shlex.split(cmd), check=True)
 
-        await JujuRun.command(any_worker, kubectl.format(command="apply"))
+        # Remove resources left by an interrupted run before recreating them.
+        await JujuRun.command(any_worker, cleanup, check=False)
+
+        await JujuRun.command(any_worker, apply)
         pods = await pods_in_state(any_worker, {"app": "microbot"}, "Running")
         yield len(pods)
     finally:
-        await JujuRun.command(any_worker, kubectl.format(command="delete"))
+        await JujuRun.command(any_worker, delete)
 
 
 async def test_restart_containerd(microbots, ops_test: OpsTest):
@@ -760,8 +845,7 @@ async def test_restart_containerd(microbots, ops_test: OpsTest):
         async with ops_test.fast_forward():
             await ops_test.model.wait_for_idle(apps=["containerd"], status="blocked", timeout=6 * 60)
 
-        nodes = await JujuRun.command(any_containerd, format_kubectl_cmd("get nodes"))
-        assert nodes.stdout.count("NotReady") == num_units, "Ensure all nodes aren't ready"
+        await nodes_in_state(any_containerd, num_units, "NotReady")
 
         # test that pods are still running while containerd is offline
         pods = await JujuRun.command(any_containerd, format_kubectl_cmd("get pods -l=app=microbot"))
@@ -778,3 +862,107 @@ async def test_restart_containerd(microbots, ops_test: OpsTest):
         await asyncio.gather(*(JujuRun.command(_, "service containerd start") for _ in containerds.units))
         async with ops_test.fast_forward():
             await ops_test.model.wait_for_idle(apps=["containerd"], status="active", timeout=6 * 60)
+
+
+async def test_resource_containerd_migration(ops_test: OpsTest):
+    """Replace legacy resource binaries with the apt package."""
+    # TODO: Consider removing this test if unreliable.
+    charm = next(Path.cwd().glob("containerd*.charm"), None)
+    if not charm:
+        charm = await ops_test.build_charm(".")
+    charm = charm.resolve()
+
+    await ops_test.track_model(
+        "resource-migration",
+        keep=False,
+        config={"default-base": "ubuntu@24.04"},
+    )
+    try:
+        with ops_test.model_context("resource-migration") as model:
+            await model.deploy(
+                "kubernetes-worker",
+                channel="latest/edge",
+                base="ubuntu@24.04",
+            )
+            # Revision 104 installs containerd from its attached resource.
+            await model.deploy(
+                "containerd",
+                application_name="containerd",
+                channel="latest/edge",
+                revision=104,
+                base="ubuntu@24.04",
+            )
+            await model.add_relation(
+                "containerd:containerd",
+                "kubernetes-worker:container-runtime",
+            )
+            # The old charm may fail after downgrading apt containerd.
+            # The resource only needs to be installed.
+            await model.wait_for_idle(
+                apps=["containerd"],
+                raise_on_error=False,
+                timeout=20 * 60,
+            )
+
+            # Confirm the old charm replaced apt containerd with resource binaries.
+            unit = model.applications["containerd"].units[0]
+            resource_version = await containerd_version(unit)
+            assert resource_version.startswith("1.")
+
+            output = await JujuRun.command(unit, "test -x /usr/bin/containerd-shim")
+            assert output.success
+
+            # Refresh the deployed old charm to the local charm.
+            await model.applications["containerd"].refresh(
+                path=charm,
+                force_units=True,
+            )
+            await model.wait_for_idle(
+                apps=["containerd"],
+                status="active",
+                timeout=20 * 60,
+            )
+
+            # Confirm the local charm replaced resource binaries with apt binaries.
+            unit = model.applications["containerd"].units[0]
+            apt_version = await containerd_version(unit)
+            assert apt_version != resource_version
+
+            output = await JujuRun.command(unit, "dpkg --verify containerd")
+            assert not output.stdout
+
+            output = await JujuRun.command(unit, "test ! -e /usr/bin/containerd-shim")
+            assert output.success
+
+            output = await JujuRun.command(unit, "ctr version")
+            assert output.success
+
+            major = await containerd_major_version(unit)
+            expected_plugins = {
+                1: {("io.containerd.grpc.v1", "cri")},
+                2: {
+                    ("io.containerd.grpc.v1", "cri"),
+                    ("io.containerd.cri.v1", "images"),
+                    ("io.containerd.cri.v1", "runtime"),
+                },
+            }
+            output = await JujuRun.command(unit, "ctr plugins ls")
+            healthy_plugins = set()
+            for line in output.stdout.splitlines():
+                fields = line.split()
+                if len(fields) != 4:
+                    continue
+
+                plugin_type, plugin_id, _, status = fields
+                if status == "ok":
+                    healthy_plugins.add((plugin_type, plugin_id))
+            assert expected_plugins[major] <= healthy_plugins
+            assert unit.workload_status_message == "Container runtime available"
+    finally:
+        # May emit "Task was destroyed but it is pending" warnings here.
+        await ops_test.forget_model(
+            "resource-migration",
+            timeout=20 * 60,
+            destroy_storage=True,
+            allow_failure=False,
+        )

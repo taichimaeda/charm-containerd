@@ -54,12 +54,27 @@ from charmhelpers.fetch.ubuntu_apt_pkg import Package
 
 NVIDIA_SOURCES_FILE = "/etc/apt/sources.list.d/nvidia.list"
 
+# https://containerd.io/releases/#kubernetes-support
+KUBERNETES_CONTAINERD_SUPPORT = {
+    (1, 35): ((2, 2, 0), (2, 1, 5), (1, 7, 28)),
+    (1, 36): ((2, 3, 0), (2, 2, 0)),
+    (1, 37): ((2, 4, 0), (2, 3, 0)),
+}
+
 
 def _containerd_version(value: str) -> typing.Tuple[int, int, int]:
     """Parse a containerd version."""
     match = re.search(r"(?<!\d)v?(\d+)\.(\d+)\.(\d+)(?!\d)", value)
     if not match:
         raise ValueError("Unable to determine containerd version from {!r}".format(value))
+    return tuple(int(part) for part in match.groups())
+
+
+def _kubernetes_version(value: str) -> typing.Tuple[int, int, int]:
+    """Parse a Kubernetes version."""
+    match = re.search(r"(?<!\d)v?(\d+)\.(\d+)\.(\d+)(?!\d)", value)
+    if not match:
+        raise ValueError("Unable to determine Kubernetes version from {!r}".format(value))
     return tuple(int(part) for part in match.groups())
 
 
@@ -100,6 +115,57 @@ def _record_config_version(version="auto") -> None:
 
     recorded_version = version if version in ("v1", "v2") else "auto"
     DB.set("containerd.config-version", recorded_version)
+
+
+def _installed_kubernetes_version() -> typing.Tuple[int, int, int]:
+    """Return the installed Kubernetes version."""
+    # Kubelet may not be available when containerd is installed.
+    # TODO: Read the Kubernetes version from the container-runtime relation.
+    output = check_output(["kubelet", "--version"]).decode()
+    return _kubernetes_version(output)
+
+
+def _containerd_supports_kubernetes(
+    kubernetes_version: typing.Tuple[int, int, int],
+    containerd_version: typing.Tuple[int, int, int],
+) -> bool:
+    """Return whether containerd is recommended for the Kubernetes version."""
+    minimum_versions = KUBERNETES_CONTAINERD_SUPPORT.get(kubernetes_version[:2], ())
+    return any(
+        containerd_version[:2] == minimum_version[:2] and containerd_version[2] >= minimum_version[2]
+        for minimum_version in minimum_versions
+    )
+
+
+def _check_containerd_compatibility(
+    containerd_version: typing.Tuple[int, int, int],
+) -> bool:
+    """Update compatibility state and return whether the versions are supported."""
+    try:
+        kubernetes_version = _installed_kubernetes_version()
+    except (FileNotFoundError, CalledProcessError, ValueError):
+        remove_state("containerd.compatibility.invalid")
+        set_state("containerd.compatibility.pending")
+        remove_state("containerd.ready")
+        return False
+
+    remove_state("containerd.compatibility.pending")
+    if not _containerd_supports_kubernetes(kubernetes_version, containerd_version):
+        set_state("containerd.compatibility.invalid")
+        remove_state("containerd.ready")
+        return False
+
+    remove_state("containerd.compatibility.invalid")
+    return True
+
+
+# NOTE: This is public only because upgrade-actions.py imports it.
+def candidate_containerd_version() -> typing.Tuple[int, int, int]:
+    """Return the containerd version offered by apt."""
+    package = apt_packages({CONTAINERD_PACKAGE}).get(CONTAINERD_PACKAGE)
+    if package is None:
+        raise RuntimeError("Containerd package is not available from apt")
+    return _containerd_version(str(package.version))
 
 
 def apt_packages(packages: typing.Set[str]) -> typing.Mapping[str, Package]:
@@ -178,20 +244,49 @@ register_trigger(when="config.changed.nvidia_apt_packages", clear_flag="containe
 
 
 def _check_containerd():
-    """
-    Check that containerd is running.
-
-    `ctr version` calls both client and server side, so is a reasonable indication that everything's been set up
-    correctly.
-
-    :return: bytes
-    """
+    """Check containerd and its CRI plugins."""
     try:
-        version = check_output(["ctr", "version"])
-    except (FileNotFoundError, CalledProcessError):
-        return None
+        version = _installed_containerd_version()
+        config_version = _containerd_config_version(version)
 
-    return version
+        # ctr version checks that the client can reach the containerd server.
+        check_output(["ctr", "version"])
+        # ctr plugins ls checks that the CRI plugins are healthy.
+        plugins = check_output(["ctr", "plugins", "ls"]).decode()
+    except (FileNotFoundError, CalledProcessError, ValueError):
+        return False
+
+    expected_plugins = {
+        1: {
+            ("io.containerd.grpc.v1", "cri"),
+        },
+        2: {
+            ("io.containerd.grpc.v1", "cri"),
+        },
+        3: {
+            ("io.containerd.grpc.v1", "cri"),
+            ("io.containerd.cri.v1", "images"),
+            ("io.containerd.cri.v1", "runtime"),
+        },
+    }[config_version]
+
+    healthy_plugins = set()
+    for line in plugins.splitlines():
+        fields = line.split()
+        if len(fields) != 4:
+            continue
+
+        plugin_type, plugin_id, _, status = fields
+        if status == "ok":
+            healthy_plugins.add((plugin_type, plugin_id))
+
+    missing_plugins = expected_plugins - healthy_plugins
+    if missing_plugins:
+        missing = ", ".join("{}/{}".format(*plugin) for plugin in sorted(missing_plugins))
+        log("Containerd CRI plugins are not healthy: {}".format(missing))
+        return False
+
+    return True
 
 
 def _juju_proxy_changed():
@@ -247,6 +342,16 @@ def charm_status():
     """
     if is_state("upgrade.series.in-progress"):
         status.blocked("Series upgrade in progress")
+    elif is_state("containerd.resource-migration.failed"):
+        status.blocked("Failed to migrate containerd binaries to apt")
+    elif is_state("containerd.install.failed"):
+        status.blocked("Failed to install containerd from apt")
+    elif is_state("containerd.custom-registries.invalid"):
+        status.blocked("Invalid custom_registries configuration")
+    elif is_state("containerd.registry-render.failed"):
+        status.blocked("Failed to render registry configuration")
+    elif is_state("containerd.config-render.failed"):
+        status.blocked("Failed to render containerd configuration")
     elif is_state("containerd.nvidia.invalid-option"):
         status.blocked("{} is an invalid option for gpu_driver".format(config().get("gpu_driver")))
     elif is_state("containerd.nvidia.fetch_keys_failed"):
@@ -255,6 +360,13 @@ def charm_status():
         status.blocked("No NVIDIA packages selected to install.")
     elif is_state("containerd.nvidia.needs_reboot"):
         status.blocked("May need reboot to activate GPU.")
+    elif is_state("containerd.compatibility.pending"):
+        status.waiting("Waiting for Kubernetes version")
+    elif is_state("containerd.compatibility.invalid"):
+        status.blocked("Unsupported Kubernetes/containerd combination")
+    # The old flow ignored pending restart retries and could report active.
+    elif is_state("containerd.restart"):
+        status.waiting("Containerd restart pending")
     elif _check_containerd():
         status.active("Container runtime available")
         set_state("containerd.ready")
@@ -404,6 +516,8 @@ class Registry:
         file_path = os.path.join(config_directory, "%s.%s" % (self.host, opt))
         with open(file_path, "wb") as f:
             f.write(file_contents)
+        # Protect client private keys with mode 0600. Certificates use 0644.
+        os.chmod(file_path, 0o600 if opt == "key" else 0o644)
         return file_path
 
     def _remove_tls_content(self, opt: str, config_directory: str) -> None:
@@ -554,20 +668,22 @@ def upgrade_charm():
 
     :return: None
     """
-    # Prevent containerd apt pkg from being implicitly updated.
-    apt_hold(CONTAINERD_PACKAGE)
-
     # Preserve an explicit config_version from older revisions.
     config_version = config().get("config_version")
     _record_config_version(config_version)
-    remove_state("containerd.resource.evaluated")
-    if is_state("containerd.resource.installed"):
-        # if a resource is currently overriding the deb,
-        # upgrade containerd from the apt packages
-        reinstall_containerd()
 
-    # Re-render config in case the template has changed in the new charm.
-    config_changed()
+    # Prevent containerd apt pkg from being implicitly updated.
+    apt_hold(CONTAINERD_PACKAGE)
+    # Older revisions may already use apt without checking compatibility.
+    # Check on refresh because those units do not run resource migration.
+    containerd_version = _installed_containerd_version()
+    _check_containerd_compatibility(containerd_version)
+
+    if not is_state("containerd.resource.installed"):
+        # Apply configuration template changes shipped by the new charm.
+        # Skip if resource binary is installed
+        # because resource migration handles config rendering itself.
+        config_changed()
 
     # Clean up old nvidia sources.list.d files
     old_source_files = [
@@ -581,6 +697,63 @@ def upgrade_charm():
 
     # Update containerd version
     remove_state("containerd.version-published")
+
+
+LEGACY_RESOURCE_BINARIES = {
+    "containerd",
+    "containerd-shim",
+    "containerd-shim-runc-v1",
+    "containerd-shim-runc-v2",
+    "containerd-stress",
+    "ctr",
+}
+
+
+def _remove_legacy_resource_binaries() -> None:
+    """Remove legacy resource binaries not owned by an installed package."""
+    for binary in LEGACY_RESOURCE_BINARIES:
+        path = Path("/usr/bin") / binary
+        if not os.path.lexists(path):
+            continue
+        try:
+            check_output(["dpkg-query", "--search", path], stderr=STDOUT)
+        except CalledProcessError:
+            log("Removing unowned legacy resource binary {}".format(path))
+            os.remove(path)
+
+
+@when("containerd.resource.installed")
+@when_not("endpoint.containerd.departed")
+def migrate_resource_containerd():
+    """Replace resource binaries with the apt package."""
+    status.maintenance("Migrating containerd binaries to apt")
+    try:
+        apt_update(fatal=True)
+        resource_version = _installed_containerd_version()
+        candidate_version = candidate_containerd_version()
+        if candidate_version < resource_version:
+            raise RuntimeError(
+                "apt candidate {} is older than resource containerd {}".format(
+                    ".".join(map(str, candidate_version)),
+                    ".".join(map(str, resource_version)),
+                )
+            )
+
+        if not reinstall_containerd(candidate_version):
+            remove_state("containerd.resource-migration.failed")
+            return
+        _remove_legacy_resource_binaries()
+    except (CalledProcessError, OSError, RuntimeError, ValueError):
+        log(traceback.format_exc())
+        set_state("containerd.resource-migration.failed")
+        return
+    remove_state("containerd.resource-migration.failed")
+
+    # Clear legacy flags for resource binaries.
+    remove_state("containerd.resource.installed")
+    remove_state("containerd.resource.evaluated")
+
+    set_state("containerd.installed")
 
 
 @when_not("containerd.br_netfilter.enabled")
@@ -611,47 +784,56 @@ def install_containerd():
     """
     # New deployments always select config_version automatically.
     _record_config_version()
+
     status.maintenance("Installing containerd via apt")
-    reinstall_containerd()
-    config_changed()
+    try:
+        apt_update(fatal=True)
+        candidate_version = candidate_containerd_version()
+        if not reinstall_containerd(candidate_version):
+            remove_state("containerd.install.failed")
+            return
+        set_state("containerd.installed")
+        remove_state("containerd.install.failed")
+    except (CalledProcessError, OSError, RuntimeError, ValueError):
+        log(traceback.format_exc())
+        set_state("containerd.install.failed")
 
 
-def reinstall_containerd():
-    """Install and hold containerd with apt."""
-    apt_update(fatal=True)
+def reinstall_containerd(candidate_version) -> bool:
+    """Render config and reinstall containerd from apt."""
+    if _check_containerd_compatibility(candidate_version) is False:
+        return False
+
+    # Render first because apt may restart the newly installed binary.
+    if not _render_config(version=candidate_version):
+        raise RuntimeError("failed to render configuration for apt candidate")
+
     apt_unhold(CONTAINERD_PACKAGE)
-    apt_install([CONTAINERD_PACKAGE, "--reinstall"], fatal=True)
-    apt_hold(CONTAINERD_PACKAGE)
-    set_state("containerd.installed")
-    remove_state("containerd.resource.evaluated")
+    try:
+        apt_install([CONTAINERD_PACKAGE, "--reinstall"], fatal=True)
+    except CalledProcessError:
+        try:
+            remaining_version = _installed_containerd_version()
+        except (CalledProcessError, FileNotFoundError, ValueError):
+            raise
+        if not _render_config(version=remaining_version):
+            raise RuntimeError("failed to restore configuration after apt failure")
+        if not host.service_restart("containerd.service"):
+            raise RuntimeError("failed to restart containerd after apt failure")
+        if not _check_containerd():
+            raise RuntimeError("containerd CRI plugins are not healthy after apt failure")
+        raise
+    finally:
+        apt_hold(CONTAINERD_PACKAGE)
+
+    if not host.service_restart("containerd.service"):
+        raise RuntimeError("failed to restart containerd after apt reinstall")
+    if not _check_containerd():
+        raise RuntimeError("containerd CRI plugins are not healthy after apt reinstall")
+    return True
 
 
 @when("containerd.installed")
-@when_not("containerd.resource.evaluated")
-def install_containerd_resource():
-    """Unpack containerd resource charm and install over deb binaries."""
-    status.maintenance("Unpacking containerd resource")
-    try:
-        bin_path = containerd.unpack_containerd_resource()
-    except containerd.ResourceFailure as e:
-        log("An error occurred extracting the resource")
-        log(traceback.format_exc())
-        status.blocked(str(e))
-        return
-
-    remove_state("containerd.resource.installed")
-    if bin_path is None:
-        log("An empty tar.gz resource was provided, using deb sources")
-    else:
-        status.maintenance("Installing containerd via resource")
-        for bin in bin_path.glob("./*"):
-            check_call(["install", bin, "/usr/bin/"])
-            set_state("containerd.resource.installed")
-    set_state("containerd.resource.evaluated")
-    set_state("containerd.restart")
-
-
-@when("containerd.resource.evaluated")
 @when_not("containerd.version-published")
 def publish_version_to_juju():
     """
@@ -659,18 +841,12 @@ def publish_version_to_juju():
 
     :return: None
     """
-    output = _check_containerd()
-    if not output:
+    try:
+        version = _installed_containerd_version()
+    except (FileNotFoundError, CalledProcessError, ValueError):
         return
 
-    output = output.decode()
-    ver_re = re.compile(r"\s*Version:\s+v{0,1}([\d\.]+)")
-    version_matches = set(m.group(1) for m in (ver_re.match(line) for line in output.split("\n")) if m)
-    if len(version_matches) != 1:
-        return
-    (version,) = version_matches
-
-    application_version_set(version)
+    application_version_set(".".join(map(str, version)))
     set_state("containerd.version-published")
 
 
@@ -886,10 +1062,12 @@ def _render_registry_config(config_directory: str, registries: typing.List[Regis
         host_directory = registry_directory / registry.host
         os.makedirs(host_directory, mode=0o755, exist_ok=True)
         hosts_file = host_directory / REGISTRY_CONFIG_FILE
+        # Protect registry host configuration with mode 0600.
         render(
             REGISTRY_CONFIG_FILE,
             str(hosts_file),
             {"registry": registry},
+            perms=0o600,
         )
 
     for host_name in previous_hosts - current_hosts:
@@ -907,21 +1085,18 @@ def _render_registry_config(config_directory: str, registries: typing.List[Regis
     DB.set("registry-hosts", sorted(current_hosts))
 
 
-@when("config.changed")
-@when_not("endpoint.containerd.departed")
-def config_changed():
+def _render_config(version=None):
     """
     Render the config template.
 
-    :return: None
+    :return: whether configuration was rendered successfully
+    :rtype: bool
     """
-    if _juju_proxy_changed():
-        set_state("containerd.juju-proxy.changed")
-
     # Create "dumb" context based on Config to avoid triggering config.changed
     context = dict(config())
 
-    version = _installed_containerd_version()
+    if version is None:
+        version = _installed_containerd_version()
     config_version = _resolve_config_version(version)
     template_config = {
         1: "config.toml",
@@ -956,15 +1131,22 @@ def config_changed():
     # validate custom_registries
     invalid_reason = invalid_custom_registries(context["custom_registries"])
     if invalid_reason:
+        set_state("containerd.custom-registries.invalid")
         log(invalid_reason)
-        status.blocked("Invalid custom_registries: {}".format(invalid_reason.splitlines()[-1]))
-        return
+        return False
+    remove_state("containerd.custom-registries.invalid")
 
-    context["custom_registries"] = merge_custom_registries(
-        CONFIG_DIRECTORY, context["custom_registries"], old_custom_registries
-    )
-    if config_version == 3:
-        _render_registry_config(CONFIG_DIRECTORY, context["custom_registries"])
+    try:
+        context["custom_registries"] = merge_custom_registries(
+            CONFIG_DIRECTORY, context["custom_registries"], old_custom_registries
+        )
+        if config_version == 3:
+            _render_registry_config(CONFIG_DIRECTORY, context["custom_registries"])
+    except (OSError, ValidationError):
+        log(traceback.format_exc())
+        set_state("containerd.registry-render.failed")
+        return False
+    remove_state("containerd.registry-render.failed")
 
     untrusted = DB.get("untrusted")
     if untrusted:
@@ -982,9 +1164,27 @@ def config_changed():
         else:
             context["runtime"] = "runc"
 
-    render(template_config, os.path.join(CONFIG_DIRECTORY, CONFIG_FILE), context)
+    try:
+        # Protect config.toml with mode 0600 because it may contain registry credentials.
+        render(template_config, os.path.join(CONFIG_DIRECTORY, CONFIG_FILE), context, perms=0o600)
+    except OSError:
+        log(traceback.format_exc())
+        set_state("containerd.config-render.failed")
+        return False
+    remove_state("containerd.config-render.failed")
 
-    set_state("containerd.restart")
+    return True
+
+
+@when("config.changed")
+@when_not("endpoint.containerd.departed")
+def config_changed():
+    """Render config and request a restart."""
+    if _juju_proxy_changed():
+        set_state("containerd.juju-proxy.changed")
+
+    if _render_config():
+        set_state("containerd.restart")
 
 
 @when("containerd.installed")
@@ -1057,10 +1257,13 @@ def restart_containerd():
     the next hook.
     """
     status.maintenance("Restarting containerd")
-    if host.service_restart("containerd.service"):
-        remove_state("containerd.restart")
-    else:
+    if not host.service_restart("containerd.service"):
         log("Failed to restart containerd; will retry")
+        return
+    if not _check_containerd():
+        log("CRI plugins are not healthy; will retry")
+        return
+    remove_state("containerd.restart")
 
 
 @when("containerd.ready")
