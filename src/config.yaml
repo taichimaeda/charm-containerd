@@ -69,7 +69,7 @@ options:
     type: string
     default: "containerd-shim"
     description: |
-      DEPRECATED: Set a custom containerd shim for containerd 1.x.
+      Set a custom containerd shim for containerd 1.x.
       This option has no effect with containerd 2.x and v3 config.
   http_proxy:
      type: string
