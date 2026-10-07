@@ -38,8 +38,93 @@ def test_containerd_config_version_unsupported(version):
         containerd._containerd_config_version(version)
 
 
+@pytest.mark.parametrize(
+    "kubernetes_version,containerd_version,supported",
+    [
+        ((1, 35, 0), (2, 2, 0), True),
+        ((1, 35, 0), (2, 2, 9), True),
+        ((1, 35, 0), (2, 2, 99), True),
+        ((1, 35, 0), (2, 1, 5), True),
+        ((1, 35, 0), (2, 1, 4), False),
+        ((1, 35, 0), (1, 7, 28), True),
+        ((1, 35, 0), (1, 7, 27), False),
+        ((1, 35, 0), (2, 3, 0), False),
+        ((1, 36, 0), (2, 3, 0), True),
+        ((1, 36, 0), (2, 2, 0), True),
+        ((1, 36, 0), (2, 1, 9), False),
+        ((1, 37, 0), (2, 4, 0), True),
+        ((1, 37, 0), (2, 3, 0), True),
+        ((1, 37, 0), (2, 2, 9), False),
+        ((1, 34, 0), (2, 2, 0), False),
+        ((1, 38, 0), (2, 4, 0), False),
+    ],
+)
+def test_containerd_supports_kubernetes(kubernetes_version, containerd_version, supported):
+    """Validate recommended Kubernetes and containerd version combinations."""
+    assert containerd._containerd_supports_kubernetes(kubernetes_version, containerd_version) is supported
+
+
+@mock.patch.object(containerd, "remove_state")
+@mock.patch.object(containerd, "set_state")
+@mock.patch.object(containerd, "_installed_kubernetes_version", side_effect=FileNotFoundError)
+def test_check_containerd_compatibility_waits_for_kubernetes(installed_kubernetes_version, set_state, remove_state):
+    """Return false until kubelet can report the Kubernetes version."""
+    assert containerd._check_containerd_compatibility((2, 2, 0)) is False
+
+    set_state.assert_called_once_with("containerd.compatibility.pending")
+    remove_state.assert_has_calls(
+        [
+            mock.call("containerd.compatibility.invalid"),
+            mock.call("containerd.ready"),
+        ]
+    )
+
+
+@mock.patch.object(containerd, "is_state", return_value=False)
+def test_charm_status_waits_for_kubernetes(is_state):
+    """Wait until kubelet can report the Kubernetes version."""
+    is_state.side_effect = lambda flag: flag == "containerd.compatibility.pending"
+    containerd.status.waiting.reset_mock()
+
+    containerd.charm_status()
+
+    containerd.status.waiting.assert_called_once_with("Waiting for Kubernetes version")
+
+
+@mock.patch.object(containerd, "is_state", return_value=False)
+def test_charm_status_blocks_unsupported_versions(is_state):
+    """Block Kubernetes and containerd combinations outside the matrix."""
+    is_state.side_effect = lambda flag: flag == "containerd.compatibility.invalid"
+    containerd.status.blocked.reset_mock()
+
+    containerd.charm_status()
+
+    containerd.status.blocked.assert_called_once_with("Unsupported Kubernetes/containerd combination")
+
+
+@mock.patch.object(containerd, "config_changed")
+@mock.patch.object(containerd, "is_state", return_value=True)
+@mock.patch.object(containerd, "remove_state")
+@mock.patch.object(containerd, "_check_containerd_compatibility")
+@mock.patch.object(containerd, "_installed_containerd_version", return_value=(2, 2, 1))
+@mock.patch.object(containerd, "apt_hold")
+def test_upgrade_charm_checks_installed_containerd(
+    apt_hold,
+    installed_containerd_version,
+    check_containerd_compatibility,
+    remove_state,
+    is_state,
+    config_changed,
+):
+    """Check the installed containerd version after a charm refresh."""
+    containerd.upgrade_charm()
+
+    check_containerd_compatibility.assert_called_once_with((2, 2, 1))
+
+
 def test_series_upgrade():
     """Verify series upgrade hook sets the status."""
+    containerd.status.blocked.reset_mock()
     flags = {
         "upgrade.series.in-progress": True,
         "containerd.nvidia.invalid-option": False,
@@ -480,6 +565,7 @@ def test_render_config_v3(
         assert target.read_text() == expected.read_text().rstrip("\n")
 
 
+@mock.patch.object(containerd, "_check_containerd_compatibility", return_value=True)
 @mock.patch.object(containerd, "_check_containerd", return_value=True)
 @mock.patch.object(containerd.host, "service_restart", return_value=True)
 @mock.patch.object(containerd, "_render_config", return_value=True)
@@ -493,10 +579,12 @@ def test_reinstall_containerd(
     render_config,
     service_restart,
     check_containerd,
+    check_containerd_compatibility,
 ):
     """Render candidate config before apt runs."""
     calls = mock.Mock()
     for name, mocked in (
+        ("check_containerd_compatibility", check_containerd_compatibility),
         ("render_config", render_config),
         ("apt_unhold", apt_unhold),
         ("apt_install", apt_install),
@@ -506,10 +594,11 @@ def test_reinstall_containerd(
     ):
         calls.attach_mock(mocked, name)
 
-    containerd.reinstall_containerd((2, 4, 1))
+    assert containerd.reinstall_containerd((2, 4, 1))
 
     # Check the full call order.
     assert calls.mock_calls == [
+        mock.call.check_containerd_compatibility((2, 4, 1)),
         mock.call.render_config(version=(2, 4, 1)),
         mock.call.apt_unhold(containerd.CONTAINERD_PACKAGE),
         mock.call.apt_install([containerd.CONTAINERD_PACKAGE, "--reinstall"], fatal=True),
@@ -519,6 +608,17 @@ def test_reinstall_containerd(
     ]
 
 
+@mock.patch.object(containerd, "_render_config")
+@mock.patch.object(containerd, "_check_containerd_compatibility", return_value=False)
+def test_reinstall_containerd_incompatible(check_containerd_compatibility, render_config):
+    """Reject an incompatible candidate before changing containerd."""
+    assert not containerd.reinstall_containerd((2, 4, 1))
+
+    check_containerd_compatibility.assert_called_once_with((2, 4, 1))
+    render_config.assert_not_called()
+
+
+@mock.patch.object(containerd, "_check_containerd_compatibility", return_value=True)
 @mock.patch.object(containerd, "_check_containerd", return_value=True)
 @mock.patch.object(containerd.host, "service_restart", return_value=True)
 @mock.patch.object(containerd, "_render_config", return_value=True)
@@ -534,10 +634,12 @@ def test_reinstall_containerd_apt_failure(
     render_config,
     service_restart,
     check_containerd,
+    check_containerd_compatibility,
 ):
     """Restore config after an apt failure."""
     calls = mock.Mock()
     for name, mocked in (
+        ("check_containerd_compatibility", check_containerd_compatibility),
         ("render_config", render_config),
         ("apt_unhold", apt_unhold),
         ("apt_install", apt_install),
@@ -552,6 +654,7 @@ def test_reinstall_containerd_apt_failure(
         containerd.reinstall_containerd((2, 4, 1))
 
     assert calls.mock_calls == [
+        mock.call.check_containerd_compatibility((2, 4, 1)),
         mock.call.render_config(version=(2, 4, 1)),
         mock.call.apt_unhold(containerd.CONTAINERD_PACKAGE),
         mock.call.apt_install([containerd.CONTAINERD_PACKAGE, "--reinstall"], fatal=True),

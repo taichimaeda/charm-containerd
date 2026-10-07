@@ -86,7 +86,8 @@ def _upgrade(containerd, gpu):
         pkg = CONTAINERD_PACKAGE
         if upgrade_list.get(f"{pkg}.upgrade-available"):
             candidate_version = candidate_containerd_version()
-            reinstall_containerd(candidate_version)
+            if not reinstall_containerd(candidate_version):
+                raise RuntimeError("containerd is incompatible with Kubernetes")
             upgrade_list[f"{pkg}.upgrade-complete"] = True
 
             # NOTE: Clearing this state republishes the upgraded containerd version.

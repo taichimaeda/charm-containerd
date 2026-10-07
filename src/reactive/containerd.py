@@ -54,12 +54,27 @@ from charmhelpers.fetch.ubuntu_apt_pkg import Package
 
 NVIDIA_SOURCES_FILE = "/etc/apt/sources.list.d/nvidia.list"
 
+# https://containerd.io/releases/#kubernetes-support
+KUBERNETES_CONTAINERD_SUPPORT = {
+    (1, 35): ((2, 2, 0), (2, 1, 5), (1, 7, 28)),
+    (1, 36): ((2, 3, 0), (2, 2, 0)),
+    (1, 37): ((2, 4, 0), (2, 3, 0)),
+}
+
 
 def _containerd_version(value: str) -> typing.Tuple[int, int, int]:
     """Parse a containerd version."""
     match = re.search(r"(?<!\d)v?(\d+)\.(\d+)\.(\d+)(?!\d)", value)
     if not match:
         raise ValueError("Unable to determine containerd version from {!r}".format(value))
+    return tuple(int(part) for part in match.groups())
+
+
+def _kubernetes_version(value: str) -> typing.Tuple[int, int, int]:
+    """Parse a Kubernetes version."""
+    match = re.search(r"(?<!\d)v?(\d+)\.(\d+)\.(\d+)(?!\d)", value)
+    if not match:
+        raise ValueError("Unable to determine Kubernetes version from {!r}".format(value))
     return tuple(int(part) for part in match.groups())
 
 
@@ -80,6 +95,48 @@ def _installed_containerd_version() -> typing.Tuple[int, int, int]:
     """Return the installed containerd version."""
     output = check_output(["containerd", "--version"]).decode()
     return _containerd_version(output)
+
+
+def _installed_kubernetes_version() -> typing.Tuple[int, int, int]:
+    """Return the installed Kubernetes version."""
+    # Kubelet may not be available when containerd is installed.
+    # TODO: Read the Kubernetes version from the container-runtime relation.
+    output = check_output(["kubelet", "--version"]).decode()
+    return _kubernetes_version(output)
+
+
+def _containerd_supports_kubernetes(
+    kubernetes_version: typing.Tuple[int, int, int],
+    containerd_version: typing.Tuple[int, int, int],
+) -> bool:
+    """Return whether containerd is recommended for the Kubernetes version."""
+    minimum_versions = KUBERNETES_CONTAINERD_SUPPORT.get(kubernetes_version[:2], ())
+    return any(
+        containerd_version[:2] == minimum_version[:2] and containerd_version[2] >= minimum_version[2]
+        for minimum_version in minimum_versions
+    )
+
+
+def _check_containerd_compatibility(
+    containerd_version: typing.Tuple[int, int, int],
+) -> bool:
+    """Update compatibility state and return whether the versions are supported."""
+    try:
+        kubernetes_version = _installed_kubernetes_version()
+    except (FileNotFoundError, CalledProcessError, ValueError):
+        remove_state("containerd.compatibility.invalid")
+        set_state("containerd.compatibility.pending")
+        remove_state("containerd.ready")
+        return False
+
+    remove_state("containerd.compatibility.pending")
+    if not _containerd_supports_kubernetes(kubernetes_version, containerd_version):
+        set_state("containerd.compatibility.invalid")
+        remove_state("containerd.ready")
+        return False
+
+    remove_state("containerd.compatibility.invalid")
+    return True
 
 
 # NOTE: This is public only because upgrade-actions.py imports it.
@@ -283,6 +340,10 @@ def charm_status():
         status.blocked("No NVIDIA packages selected to install.")
     elif is_state("containerd.nvidia.needs_reboot"):
         status.blocked("May need reboot to activate GPU.")
+    elif is_state("containerd.compatibility.pending"):
+        status.waiting("Waiting for Kubernetes version")
+    elif is_state("containerd.compatibility.invalid"):
+        status.blocked("Unsupported Kubernetes/containerd combination")
     # NOTE: The old flow ignored pending restart retries and could report active.
     elif is_state("containerd.restart"):
         status.waiting("Containerd restart pending")
@@ -594,6 +655,10 @@ def upgrade_charm():
     # Prevent containerd apt pkg from being implicitly updated.
     apt_hold(CONTAINERD_PACKAGE)
 
+    # Check compatibility again at least when the charm is refreshed.
+    containerd_version = _installed_containerd_version()
+    _check_containerd_compatibility(containerd_version)
+
     if not is_state("containerd.resource.installed"):
         # Apply configuration template changes shipped by the new charm.
         # Skip if resource binary is installed
@@ -654,7 +719,9 @@ def migrate_resource_containerd():
                 )
             )
 
-        reinstall_containerd(candidate_version)
+        if not reinstall_containerd(candidate_version):
+            remove_state("containerd.resource-migration.failed")
+            return
         _remove_legacy_resource_binaries()
     except (CalledProcessError, OSError, RuntimeError, ValueError):
         log(traceback.format_exc())
@@ -699,7 +766,9 @@ def install_containerd():
     try:
         apt_update(fatal=True)
         candidate_version = candidate_containerd_version()
-        reinstall_containerd(candidate_version)
+        if not reinstall_containerd(candidate_version):
+            remove_state("containerd.install.failed")
+            return
         set_state("containerd.installed")
         remove_state("containerd.install.failed")
     except (CalledProcessError, OSError, RuntimeError, ValueError):
@@ -707,8 +776,11 @@ def install_containerd():
         set_state("containerd.install.failed")
 
 
-def reinstall_containerd(candidate_version) -> None:
+def reinstall_containerd(candidate_version) -> bool:
     """Render config and reinstall containerd from apt."""
+    if _check_containerd_compatibility(candidate_version) is False:
+        return False
+
     # Render first because apt may restart the newly installed binary.
     if not _render_config(version=candidate_version):
         raise RuntimeError("failed to render configuration for apt candidate")
@@ -735,6 +807,7 @@ def reinstall_containerd(candidate_version) -> None:
         raise RuntimeError("failed to restart containerd after apt reinstall")
     if not _check_containerd():
         raise RuntimeError("containerd CRI plugins are not healthy after apt reinstall")
+    return True
 
 
 @when("containerd.installed")

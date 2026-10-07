@@ -36,7 +36,7 @@ async def test_build_and_deploy(ops_test):
         charm = await ops_test.build_charm(".")
 
     overlays = [
-        ops_test.Bundle("kubernetes-core", channel="edge"),
+        ops_test.Bundle("kubernetes-core", channel="1.36/edge"),
         Path("tests/data/charm.yaml"),
     ]
 
