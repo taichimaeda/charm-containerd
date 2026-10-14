@@ -306,6 +306,29 @@ def test_render_registry_config(render, tmp_path):
     assert unitdata.kv().get("registry-hosts") == ["registry.example"]
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "",
+        ".",
+        "..",
+        "https://registry.example",
+        "registry.example/",
+        "registry.example/path",
+    ],
+)
+@mock.patch.object(containerd, "render")
+def test_render_registry_config_invalid_host(render, tmp_path, host):
+    """Reject registry hosts that cannot be used by config v3."""
+    registry = containerd.Registry(url="https://registry.example", host=host)
+
+    with pytest.raises(containerd.ValidationError, match="not valid"):
+        containerd._render_registry_config(str(tmp_path), [registry])
+
+    render.assert_not_called()
+    assert not (tmp_path / "certs.d").exists()
+
+
 @mock.patch.object(containerd, "render")
 def test_render_registry_config_stale(render, tmp_path):
     """Remove stale registry hosts."""

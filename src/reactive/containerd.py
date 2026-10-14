@@ -342,9 +342,6 @@ class Registry:
         """
         if self.host is None:
             self.host = strip_url(self.url)
-        # Validate registry hosts because v3 uses them as directory names.
-        if not self.host or self.host in (".", "..") or "/" in self.host:
-            raise ValidationError("registry host {!r} is not valid".format(self.host))
 
     @property
     def server(self) -> str:
@@ -876,11 +873,15 @@ REGISTRY_CONFIG_FILE = "hosts.toml"
 
 def _render_registry_config(config_directory: str, registries: typing.List[Registry]) -> None:
     """Render hosts.toml files and remove stale files."""
+    previous_hosts = set(DB.get("registry-hosts", []))
+    current_hosts = set()
+    for registry in registries:
+        if not registry.host or registry.host in (".", "..") or "/" in registry.host:
+            raise ValidationError("registry host {!r} is not valid".format(registry.host))
+        current_hosts.add(registry.host)
+
     registry_directory = Path(config_directory) / REGISTRY_CONFIG_DIRECTORY
     os.makedirs(registry_directory, mode=0o755, exist_ok=True)
-
-    current_hosts = {registry.host for registry in registries}
-    previous_hosts = set(DB.get("registry-hosts", []))
 
     for registry in registries:
         host_directory = registry_directory / registry.host
@@ -964,7 +965,11 @@ def config_changed():
         CONFIG_DIRECTORY, context["custom_registries"], old_custom_registries
     )
     if config_version == 3:
-        _render_registry_config(CONFIG_DIRECTORY, context["custom_registries"])
+        try:
+            _render_registry_config(CONFIG_DIRECTORY, context["custom_registries"])
+        except ValidationError as error:
+            status.blocked("Invalid custom_registries: {}".format(error))
+            return
 
     untrusted = DB.get("untrusted")
     if untrusted:
