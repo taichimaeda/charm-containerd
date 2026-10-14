@@ -243,7 +243,8 @@ def test_merge_custom_registries(tmp_path):
     assert not os.path.exists(os.path.join(tmp_path, "my.other.registry.cert"))
 
 
-def test_merge_custom_registries_duplicate(tmp_path):
+@mock.patch.object(containerd, "update_custom_tls_config")
+def test_merge_custom_registries_duplicate(update_custom_tls_config, tmp_path):
     """Reject duplicate relation and config registries."""
     unitdata.kv().set(
         "registry",
@@ -256,6 +257,8 @@ def test_merge_custom_registries_duplicate(tmp_path):
 
     with pytest.raises(containerd.DuplicateError):
         containerd.merge_custom_registries(tmp_path, registries, None)
+
+    update_custom_tls_config.assert_not_called()
 
 
 def test_insert_registry_from_relation():

@@ -410,9 +410,12 @@ class Registry:
 
     def install_tls(self, config_directory):
         """Install tls content onto the file system."""
-        self.ca = self._write_tls_content(self.ca_file, "ca", config_directory)
-        self.key = self._write_tls_content(self.key_file, "key", config_directory)
-        self.cert = self._write_tls_content(self.cert_file, "cert", config_directory)
+        if self.ca_file is not None:
+            self.ca = self._write_tls_content(self.ca_file, "ca", config_directory)
+        if self.key_file is not None:
+            self.key = self._write_tls_content(self.key_file, "key", config_directory)
+        if self.cert_file is not None:
+            self.cert = self._write_tls_content(self.cert_file, "cert", config_directory)
 
     def uninstall_tls(self, config_directory):
         """Remove tls content from the file system."""
@@ -508,12 +511,12 @@ def merge_custom_registries(config_directory, custom_registries, old_custom_regi
     """
     registries = _registries_list(custom_registries, default=[])
     registries = insert_docker_io_to_custom_registries(registries)
+    registries = _insert_registry_from_relation(registries)
+
     old_registries = []
     if old_custom_registries:
         old_registries += _registries_list(old_custom_registries, default=[])
     update_custom_tls_config(config_directory, registries, old_registries)
-
-    registries = _insert_registry_from_relation(registries)
 
     return registries
 
@@ -961,15 +964,15 @@ def config_changed():
         status.blocked("Invalid custom_registries: {}".format(invalid_reason.splitlines()[-1]))
         return
 
-    context["custom_registries"] = merge_custom_registries(
-        CONFIG_DIRECTORY, context["custom_registries"], old_custom_registries
-    )
-    if config_version == 3:
-        try:
+    try:
+        context["custom_registries"] = merge_custom_registries(
+            CONFIG_DIRECTORY, context["custom_registries"], old_custom_registries
+        )
+        if config_version == 3:
             _render_registry_config(CONFIG_DIRECTORY, context["custom_registries"])
-        except ValidationError as error:
-            status.blocked("Invalid custom_registries: {}".format(error))
-            return
+    except ValidationError as error:
+        status.blocked("Invalid custom_registries: {}".format(error))
+        return
 
     untrusted = DB.get("untrusted")
     if untrusted:
