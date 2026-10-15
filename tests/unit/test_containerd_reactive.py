@@ -45,63 +45,33 @@ def test_containerd_config_version_unsupported(version):
 
 
 @pytest.mark.parametrize(
-    "recorded_version,selected_version",
+    "auto,config_version,selected_version",
     [
-        ("v1", 1),
-        ("v2", 2),
-        ("auto", 3),
-        (None, 3),
+        (False, "v1", 1),
+        (False, "v2", 2),
+        (False, "auto", 3),
+        (True, "v1", 3),
+        (True, "v2", 3),
+        (True, "auto", 3),
     ],
 )
-@mock.patch.object(containerd.DB, "get")
-def test_resolve_config_version(db_get, recorded_version, selected_version):
-    """Use the recorded version or select one automatically."""
-    db_get.return_value = recorded_version
+@mock.patch.object(containerd, "config")
+@mock.patch.object(containerd, "is_state")
+def test_resolve_config_version(is_state, config, auto, config_version, selected_version):
+    """Use the configured version or select one automatically."""
+    is_state.return_value = auto
+    config.return_value.get.return_value = config_version
 
     assert containerd._resolve_config_version((2, 2, 1)) == selected_version
 
 
-@mock.patch.object(containerd.DB, "get", return_value="invalid")
-def test_resolve_config_version_invalid(db_get):
-    """Reject an invalid recorded version."""
-    with pytest.raises(ValueError, match="Invalid recorded config version"):
+@mock.patch.object(containerd, "config")
+@mock.patch.object(containerd, "is_state", return_value=False)
+def test_resolve_config_version_invalid(is_state, config):
+    """Reject an invalid configured version."""
+    config.return_value.get.return_value = "invalid"
+    with pytest.raises(ValueError, match="Invalid config version"):
         containerd._resolve_config_version((2, 2, 1))
-
-
-@pytest.mark.parametrize(
-    "version",
-    [
-        "v1",
-        "v2",
-        "auto",
-    ],
-)
-@mock.patch.object(containerd.DB, "set")
-@mock.patch.object(containerd.DB, "get", return_value=None)
-def test_record_config_version(db_get, db_set, version):
-    """Record the configured version."""
-    containerd._record_config_version(version)
-
-    recorded_version = version if version in ("v1", "v2") else "auto"
-    db_set.assert_called_once_with("containerd.config-version", recorded_version)
-
-
-@mock.patch.object(containerd.DB, "set")
-@mock.patch.object(containerd.DB, "get", return_value=None)
-def test_record_config_version_default(db_get, db_set):
-    """Record auto by default."""
-    containerd._record_config_version()
-
-    db_set.assert_called_once_with("containerd.config-version", "auto")
-
-
-@mock.patch.object(containerd.DB, "set")
-@mock.patch.object(containerd.DB, "get", return_value="auto")
-def test_record_config_version_once(db_get, db_set):
-    """Record the config version only once."""
-    containerd._record_config_version("v1")
-
-    db_set.assert_not_called()
 
 
 def test_series_upgrade():
@@ -393,6 +363,7 @@ def test_config_changed(
     mock_endpoint_from_flag.return_value.get_sandbox_image.return_value = "sandbox-image"
     flags = {
         "containerd.nvidia.available": gpu == "on",
+        "containerd.config-version.auto": True,
     }
     is_state.side_effect = lambda flag: flags[flag]
     config["custom_registries"] = json.dumps(

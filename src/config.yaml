@@ -98,9 +98,9 @@ options:
     default: auto
     description: |
         DEPRECATED: This option will be removed in a future release. Existing
-        deployments retain an explicit v1 or v2 value recorded during charm
-        refresh. New deployments use auto, which selects the configuration
-        version based on the installed containerd version.
+        deployments upgraded from earlier revisions may select v1, v2, or auto.
+        New deployments use auto, which selects the configuration version based
+        on the installed containerd version.
   nvidia_apt_key_urls:
     type: string
     default: |

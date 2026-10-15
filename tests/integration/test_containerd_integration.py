@@ -330,28 +330,29 @@ async def test_config_version_ignored(ops_test, juju_config):
 
 
 @pytest.mark.parametrize(
-    "old_version,new_version,expected_version",
+    "config_version1,config_version2,expected_version1,expected_version2",
     [
-        (None, "v1", 3),
-        ("v1", "v2", 1),
-        ("v2", "v1", 2),
+        (None, "v1", 3, 1),
+        ("v1", "v2", 1, 2),
+        ("v2", "auto", 2, 3),
     ],
 )
 async def test_config_version_preserved(
     ops_test,
     tmp_path,
-    old_version,
-    new_version,
-    expected_version,
+    config_version1,
+    config_version2,
+    expected_version1,
+    expected_version2,
 ):
-    """Preserve explicit config_version on a refreshed deployment."""
+    """Preserve config_version support on an upgraded deployment."""
     charm = (await ops_test.build_charm(".")).resolve()
 
     # Use the empty-resource workaround.
     empty_resource = tmp_path / "containerd.tgz"
     empty_resource.touch()
 
-    model_name = f"config-version-{old_version or 'unset'}"
+    model_name = f"config-version-{config_version1 or 'unset'}"
     await ops_test.track_model(
         model_name,
         keep=False,
@@ -370,7 +371,7 @@ async def test_config_version_preserved(
             #     channel="latest/edge",
             #     revision=104,
             #     base="ubuntu@24.04",
-            #     config={"config_version": old_version} if old_version else None,
+            #     config={"config_version": config_version1} if config_version1 else None,
             #     resources={"containerd": str(empty_resource)},
             # )
             # Work around model.deploy() failing with an empty resource:
@@ -391,8 +392,8 @@ async def test_config_version_preserved(
                 "--resource",
                 f"containerd={empty_resource}",
             ]
-            if old_version:
-                deploy.extend(("--config", f"config_version={old_version}"))
+            if config_version1:
+                deploy.extend(("--config", f"config_version={config_version1}"))
             rc, stdout, stderr = await ops_test.run(*deploy)
             assert rc == 0, f"Containerd deploy failed: {(stderr or stdout).strip()}"
 
@@ -411,7 +412,7 @@ async def test_config_version_preserved(
 
             # Default before config_version was deprecated.
             charm_config = await application.get_config()
-            assert charm_config["config_version"]["value"] == (old_version or "v2")
+            assert charm_config["config_version"]["value"] == (config_version1 or "v2")
 
             await application.refresh(
                 path=charm,
@@ -425,21 +426,24 @@ async def test_config_version_preserved(
 
             # Default after config_version was deprecated.
             charm_config = await application.get_config()
-            assert charm_config["config_version"]["value"] == (old_version or "auto")
+            assert charm_config["config_version"]["value"] == (config_version1 or "auto")
 
             unit = application.units[0]
             config = await containerd_config(unit)
-            assert containerd_config_version(config) == expected_version
+            assert containerd_config_version(config) == expected_version1
 
-            # Set a new config_version after the old value has been recorded.
-            await application.set_config({"config_version": new_version})
+            # Change config_version after the deployment has been upgraded.
+            await application.set_config({"config_version": config_version2})
             await model.wait_for_idle(
                 apps=["containerd"],
                 status="active",
                 timeout=20 * 60,
             )
 
-            # Refresh again to ensure the old value is preserved.
+            config = await containerd_config(unit)
+            assert containerd_config_version(config) == expected_version2
+
+            # Refresh again to ensure the new value is preserved.
             await application.refresh(
                 path=charm,
                 force_units=True,
@@ -451,7 +455,7 @@ async def test_config_version_preserved(
             )
 
             config = await containerd_config(unit)
-            assert containerd_config_version(config) == expected_version
+            assert containerd_config_version(config) == expected_version2
     finally:
         await ops_test.forget_model(
             model_name,

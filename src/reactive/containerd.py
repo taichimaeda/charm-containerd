@@ -82,24 +82,16 @@ def _installed_containerd_version() -> typing.Tuple[int, int, int]:
 
 
 def _resolve_config_version(version: typing.Tuple[int, int, int]) -> int:
-    """Return the recorded legacy config version or detect it from containerd."""
-    recorded_version = DB.get("containerd.config-version")
-    if recorded_version in ("v1", "v2"):
-        return int(recorded_version.removeprefix("v"))
-    # None means config_version has not been recorded.
-    # "auto" means it was recorded without a v1/v2 override.
-    if recorded_version in (None, "auto"):
+    """Return the configured legacy version or detect it from containerd."""
+    config_version = config().get("config_version")
+    if is_state("containerd.config-version.auto"):
+        config_version = "auto"
+
+    if config_version in ("v1", "v2"):
+        return int(config_version.removeprefix("v"))
+    if config_version == "auto":
         return _containerd_config_version(version)
-    raise ValueError("Invalid recorded config version {!r}".format(recorded_version))
-
-
-def _record_config_version(version="auto") -> None:
-    """Record the legacy config version or that no override was set."""
-    if DB.get("containerd.config-version") is not None:
-        return
-
-    recorded_version = version if version in ("v1", "v2") else "auto"
-    DB.set("containerd.config-version", recorded_version)
+    raise ValueError("Invalid config version {!r}".format(config_version))
 
 
 def apt_packages(packages: typing.Set[str]) -> typing.Mapping[str, Package]:
@@ -547,6 +539,16 @@ def update_status():
         set_state("containerd.juju-proxy.changed")
 
 
+@hook("install")
+def install_charm():
+    """
+    Triggered when install is called.
+
+    :return: None
+    """
+    set_state("containerd.config-version.auto")
+
+
 @hook("upgrade-charm")
 def upgrade_charm():
     """
@@ -557,9 +559,6 @@ def upgrade_charm():
     # Prevent containerd apt pkg from being implicitly updated.
     apt_hold(CONTAINERD_PACKAGE)
 
-    # Preserve an explicit config_version from older revisions.
-    config_version = config().get("config_version")
-    _record_config_version(config_version)
     remove_state("containerd.resource.evaluated")
     if is_state("containerd.resource.installed"):
         # if a resource is currently overriding the deb,
@@ -609,8 +608,6 @@ def install_containerd():
 
     :return: None
     """
-    # New deployments always select config_version automatically.
-    _record_config_version()
     status.maintenance("Installing containerd via apt")
     reinstall_containerd()
     config_changed()
