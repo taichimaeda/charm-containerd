@@ -32,7 +32,7 @@ oom_score = 0
       sandbox = "{{ sandbox_image }}"
     [plugins."io.containerd.cri.v1.images".registry]
       config_path = "/etc/containerd/certs.d"
-      # registry.configs.*.auth is deprecated but still supported.
+      {#- registry.configs.*.auth is deprecated but still supported. #}
       {%- for registry in custom_registries %}
       {%- if registry.username and registry.password %}
       [plugins."io.containerd.cri.v1.images".registry.configs."{{ registry.url_stripped }}".auth]
@@ -57,7 +57,7 @@ oom_score = 0
           [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
             SystemdCgroup = false
         {%- if untrusted %}
-        # io.kubernetes.cri.untrusted-workload annotations may select this handler.
+        {#- io.kubernetes.cri.untrusted-workload annotations may select this handler. #}
         [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.untrusted]
           runtime_type = "io.containerd.{{ untrusted_name }}.v2"
         {%- if untrusted_name != "untrusted" %}
