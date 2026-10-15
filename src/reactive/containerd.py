@@ -87,11 +87,21 @@ def _resolve_config_version(version: typing.Tuple[int, int, int]) -> int:
     if is_state("containerd.config-version.auto"):
         config_version = "auto"
 
-    if config_version in ("v1", "v2"):
-        return int(config_version.removeprefix("v"))
     if config_version == "auto":
         return _containerd_config_version(version)
-    raise ValueError("Invalid config version {!r}".format(config_version))
+    if config_version not in ("v1", "v2"):
+        raise ValueError("Invalid config_version {!r}".format(config_version))
+
+    selected_version = int(config_version.removeprefix("v"))
+    if selected_version == 1 and (1, 0, 0) <= version < (2, 0, 0):
+        return selected_version
+    if selected_version == 2 and (1, 3, 0) <= version < (3, 0, 0):
+        return selected_version
+    raise ValueError(
+        "config_version {!r} is incompatible with containerd {}".format(
+            config_version, ".".join(map(str, version))
+        )
+    )
 
 
 def apt_packages(packages: typing.Set[str]) -> typing.Mapping[str, Package]:
@@ -922,8 +932,13 @@ def config_changed():
     # Create "dumb" context based on Config to avoid triggering config.changed
     context = dict(config())
 
-    version = _installed_containerd_version()
-    config_version = _resolve_config_version(version)
+    try:
+        version = _installed_containerd_version()
+        config_version = _resolve_config_version(version)
+    except ValueError as error:
+        status.blocked(str(error))
+        return
+
     template_config = {
         1: "config.toml",
         2: "config_v2.toml",

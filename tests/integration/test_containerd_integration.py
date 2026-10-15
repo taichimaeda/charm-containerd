@@ -332,8 +332,7 @@ async def test_config_version_ignored(ops_test, juju_config):
 @pytest.mark.parametrize(
     "config_version1,config_version2,expected_version1,expected_version2",
     [
-        (None, "v1", 3, 1),
-        ("v1", "v2", 1, 2),
+        (None, "v2", 3, 2),
         ("v2", "auto", 2, 3),
     ],
 )

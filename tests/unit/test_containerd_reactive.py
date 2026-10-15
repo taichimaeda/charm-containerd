@@ -47,7 +47,6 @@ def test_containerd_config_version_unsupported(version):
 @pytest.mark.parametrize(
     "auto,config_version,selected_version",
     [
-        (False, "v1", 1),
         (False, "v2", 2),
         (False, "auto", 3),
         (True, "v1", 3),
@@ -65,12 +64,29 @@ def test_resolve_config_version(is_state, config, auto, config_version, selected
     assert containerd._resolve_config_version((2, 2, 1)) == selected_version
 
 
+@pytest.mark.parametrize(
+    "config_version,version",
+    [
+        ("v1", (2, 0, 0)),
+        ("v2", (1, 2, 13)),
+    ],
+)
+@mock.patch.object(containerd, "config")
+@mock.patch.object(containerd, "is_state", return_value=False)
+def test_resolve_config_version_incompatible(is_state, config, config_version, version):
+    """Reject a config version incompatible with containerd."""
+    config.return_value.get.return_value = config_version
+
+    with pytest.raises(ValueError, match="incompatible"):
+        containerd._resolve_config_version(version)
+
+
 @mock.patch.object(containerd, "config")
 @mock.patch.object(containerd, "is_state", return_value=False)
 def test_resolve_config_version_invalid(is_state, config):
     """Reject an invalid configured version."""
     config.return_value.get.return_value = "invalid"
-    with pytest.raises(ValueError, match="Invalid config version"):
+    with pytest.raises(ValueError, match="Invalid config_version"):
         containerd._resolve_config_version((2, 2, 1))
 
 
