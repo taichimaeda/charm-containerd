@@ -200,6 +200,49 @@ def test_registries_list():
     assert "is not a list" in str(ie.value)
 
 
+@pytest.mark.parametrize(
+    "url,host,server",
+    [
+        (
+            "http://registry.example:5000/",
+            "registry.example:5000",
+            "http://registry.example:5000/",
+        ),
+        (
+            "https://registry.example:5000/prefix/",
+            "registry.example:5000",
+            "https://registry.example:5000/prefix/",
+        ),
+        (
+            "http://mirror.example:5000",
+            "registry.example:5000",
+            "https://registry.example:5000",
+        ),
+    ],
+)
+def test_registry_server(url, host, server):
+    """Return the registry URL or the fallback for a mirror."""
+    registry = containerd.Registry(url=url, host=host)
+
+    assert registry.server == server
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "registry.example:5000",
+        "https://registry.example:5000",
+        "https://registry.example:5000/docker.io",
+        "registry.example:5000/docker.io",
+    ],
+)
+def test_registry_url_host(url):
+    """Return the registry host and port from URL variants."""
+    registry = containerd.Registry(url=url)
+
+    assert registry.url_host == "registry.example:5000"
+
+
 def test_merge_custom_registries(tmp_path):
     """Verify merges of registries."""
     config = [

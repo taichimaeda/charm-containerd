@@ -12,6 +12,7 @@ import typing
 from subprocess import check_call, check_output, CalledProcessError, STDOUT
 import urllib.request
 import urllib.error
+import urllib.parse
 
 from charms.reactive import (
     hook,
@@ -347,25 +348,20 @@ class Registry:
 
     @property
     def server(self) -> str:
-        """Return the fallback registry for v3 config."""
-        if self.host == strip_url(self.url):
-            return self.url_normalized
+        """Return the server endpoint for v3 config."""
+        # If they match, the URL points directly to the registry.
+        # Otherwise, the URL points to a mirror and the registry host is the fallback.
+        if self.host == self.url_host:
+            return self.url
         return "https://{}".format(self.host)
 
     @property
-    def url_stripped(self) -> str:
-        """Return the URL without its scheme for v3 config."""
-        return strip_url(self.url)
-
-    @property
-    def url_normalized(self) -> str:
-        """Return the URL with a scheme and no trailing slash for v3 config."""
-        url = self.url.rstrip("/")
-        if url.startswith("http://"):
-            return url
-        if url.startswith("https://"):
-            return url
-        return "https://{}".format(url)
+    def url_host(self) -> str:
+        """Return the host and optional port from the URL."""
+        url = self.url
+        if "://" not in url:
+            url = "https://{}".format(url)
+        return urllib.parse.urlsplit(url).netloc
 
     @classmethod
     def from_dict(cls, idx: int, value: typing.Mapping[str, typing.Any]):
