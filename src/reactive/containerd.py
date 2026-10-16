@@ -250,6 +250,10 @@ def charm_status():
     """
     if is_state("upgrade.series.in-progress"):
         status.blocked("Series upgrade in progress")
+    elif is_state("containerd.config-version.unsupported"):
+        status.blocked("Unsupported containerd config version")
+    elif is_state("containerd.custom-registries.invalid"):
+        status.blocked("Invalid custom_registries")
     elif is_state("containerd.nvidia.invalid-option"):
         status.blocked("{} is an invalid option for gpu_driver".format(config().get("gpu_driver")))
     elif is_state("containerd.nvidia.fetch_keys_failed"):
@@ -931,9 +935,10 @@ def config_changed():
     try:
         version = _installed_containerd_version()
         config_version = _resolve_config_version(version)
-    except ValueError as error:
-        status.blocked(str(error))
+    except ValueError:
+        set_state("containerd.config-version.unsupported")
         return
+    remove_state("containerd.config-version.unsupported")
 
     template_config = {
         1: "config.toml",
@@ -978,9 +983,10 @@ def config_changed():
         )
         if config_version == 3:
             _render_registry_config(CONFIG_DIRECTORY, context["custom_registries"])
-    except ValidationError as error:
-        status.blocked("Invalid custom_registries: {}".format(error))
+    except ValidationError:
+        set_state("containerd.custom-registries.invalid")
         return
+    remove_state("containerd.custom-registries.invalid")
 
     untrusted = DB.get("untrusted")
     if untrusted:

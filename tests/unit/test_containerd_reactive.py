@@ -90,17 +90,23 @@ def test_resolve_config_version_invalid(is_state, config):
         containerd._resolve_config_version((2, 2, 1))
 
 
-def test_series_upgrade():
-    """Verify series upgrade hook sets the status."""
-    flags = {
-        "upgrade.series.in-progress": True,
-        "containerd.nvidia.invalid-option": False,
-    }
-    is_state.side_effect = lambda flag: flags[flag]
-    assert containerd.status.blocked.call_count == 0
+@pytest.mark.parametrize(
+    "state,message",
+    [
+        ("upgrade.series.in-progress", "Series upgrade in progress"),
+        ("containerd.config-version.unsupported", "Unsupported containerd config version"),
+        ("containerd.custom-registries.invalid", "Invalid custom_registries"),
+    ],
+)
+def test_charm_status_blocked(state, message):
+    """Show a blocked status for a persistent error state."""
+    is_state.side_effect = lambda flag: flag == state
+    containerd.status.blocked.reset_mock()
+
     with mock.patch("reactive.containerd._check_containerd", return_value=False):
         containerd.charm_status()
-    containerd.status.blocked.assert_called_once_with("Series upgrade in progress")
+
+    containerd.status.blocked.assert_called_once_with(message)
 
 
 @mock.patch.object(containerd, "endpoint_from_flag")
